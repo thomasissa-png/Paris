@@ -33,8 +33,9 @@ BATCH_SIZE = 100
 MAX_PAGES = 5           # up to 500 markets
 MAX_DAYS = 60
 MIN_VOLUME = 1000
-MIN_LIQUIDITY = 500
+MIN_LIQUIDITY = 5000
 CACHE_TTL = 25          # seconds
+MAX_ANN_ROI = 1000.0    # cap annualized ROI to avoid absurd display
 PORT = 5000
 
 # Crypto filter — ONLY unambiguous tokens
@@ -161,31 +162,51 @@ def extract_category(m: dict) -> str:
 # Scoring
 # ---------------------------------------------------------------------------
 
-def classify(max_price: float, deviation: float) -> tuple[str | None, str, str]:
-    """(tier, reason_label, reason_type) or (None, '', '')."""
+def classify(max_price: float, deviation: float,
+             price_sum: float) -> tuple[str | None, str, str]:
+    """Classify opportunity: (tier, reason_label, reason_type) or (None,'','').
+
+    Philosophy: only REAL edge matters.
+    - arbitrage (sum < 1.0) = guaranteed profit → top priority
+    - overround (sum > 1.0) = market margin, informational only
+    - near_certain = high probability, fairly priced (EV ≈ 0)
+    """
     if max_price > 0.995:
         return (None, "", "")  # Too certain — negligible profit
+
+    # --- Guaranteed arbitrage (sum < 1.0) — REAL edge ---
+    if price_sum < 1.0 and deviation > 0.03:
+        return ("super", "Arb garanti", "arbitrage")
+    if price_sum < 1.0 and deviation > 0.01:
+        return ("interesting", "Petit arb", "arbitrage")
+    if price_sum < 1.0 and deviation > 0.005:
+        return ("watch", "Micro arb", "arbitrage")
+
+    # --- Overround (sum > 1.0) = market margin, NOT an opportunity ---
+    if price_sum > 1.0 and deviation > 0.04:
+        return ("watch", "Overround", "overround")
+
+    # --- Near-certain (fairly priced, EV ≈ 0, high probability) ---
     if max_price > 0.90:
-        return ("super", "Near-certain", "near_certain")
-    if deviation > 0.04:
-        return ("super", "Mispricing", "mispricing")
-    if 0.80 < max_price <= 0.90:
-        return ("interesting", "High confidence", "near_certain")
-    if 0.02 < deviation <= 0.04:
-        return ("interesting", "Mod. mispricing", "mispricing")
-    if 0.70 < max_price <= 0.80:
-        return ("watch", "Imbalance", "near_certain")
-    if 0.01 < deviation <= 0.02:
-        return ("watch", "Slight mispricing", "mispricing")
+        return ("interesting", "Haute proba", "near_certain")
+    if max_price > 0.80:
+        return ("watch", "Proba moderee", "near_certain")
+
     return (None, "", "")
 
 
-def compute_score(max_price: float, deviation: float,
+def compute_score(deviation: float, price_sum: float, max_price: float,
                   days_left: float, liquidity: float) -> float:
-    cert = max_price if max_price > 0.70 else min(deviation * 15, 1.0)
+    """Score by attractiveness. Arbs (real edge) >> near-certain (no edge)."""
+    if price_sum < 1.0 and deviation > 0.005:
+        edge = deviation * 20          # arb: bigger gap = better
+    elif price_sum > 1.0 and deviation > 0.04:
+        edge = deviation * 2           # overround: low priority
+    else:
+        edge = max(max_price - 0.70, 0) * 0.3  # near-certain: reduced weight
     time_f = 1.0 / max(days_left, 0.08)
     liq_f = min(math.log10(max(liquidity, 1)) / 6.0, 1.0)
-    return round(cert * time_f * liq_f * 10000, 1)
+    return round(edge * time_f * liq_f * 10000, 1)
 
 # ---------------------------------------------------------------------------
 # Process one market → opportunity dict or None
@@ -222,6 +243,13 @@ def process_market(m: dict, now: datetime) -> dict | None:
 
     # --- Crypto gate ---
     if is_crypto(question):
+        return None
+
+    # --- Volume 24h gate (skip dead markets when data available) ---
+    has_24h = (m.get("volume24hr") is not None or
+               m.get("volume24Hr") is not None or
+               m.get("volume_24h") is not None)
+    if has_24h and volume_24h <= 0:
         return None
 
     # --- Parse outcomes ---
@@ -263,7 +291,7 @@ def process_market(m: dict, now: datetime) -> dict | None:
         no_label = f"Others ({num_outcomes - 1})"
 
     # --- Classify ---
-    tier, reason_label, reason_type = classify(max_price, deviation)
+    tier, reason_label, reason_type = classify(max_price, deviation, price_sum)
     if tier is None:
         return None
 
@@ -276,12 +304,12 @@ def process_market(m: dict, now: datetime) -> dict | None:
         days_unit = "d"
 
     # --- Trade recommendation ---
-    if reason_type == "mispricing" and price_sum < 1.0:
+    if reason_type == "arbitrage":
         trade_label = f"ARB: BUY ALL @ {int(price_sum * 100)}\u00a2"
         trade_side_class = "arb"
         buy_price = price_sum
         is_guaranteed = True
-    elif reason_type == "mispricing" and price_sum > 1.0:
+    elif reason_type == "overround":
         cheap_idx = min(range(num_outcomes), key=lambda i: float_prices[i])
         cheap_name = outcomes[cheap_idx] if cheap_idx < len(outcomes) else f"Out.{cheap_idx + 1}"
         cheap_price = float_prices[cheap_idx]
@@ -295,16 +323,24 @@ def process_market(m: dict, now: datetime) -> dict | None:
         buy_price = max_price
         is_guaranteed = False
 
+    # --- Profit, ROI, EV ---
     profit_100 = round(100 * (1.0 / buy_price - 1.0), 2) if buy_price > 0 else 0
     roi_pct = (1.0 / buy_price - 1.0) * 100 if buy_price > 0 else 0
-    ann_roi = round(roi_pct * (365.0 / max(days_left, 0.04)), 1)
+    ann_roi = min(round(roi_pct * (365.0 / max(days_left, 0.04)), 1), MAX_ANN_ROI)
+
+    if reason_type == "arbitrage":
+        ev_per_100 = round((1.0 - price_sum) / price_sum * 100, 2) if price_sum > 0 else 0
+        risk_per_100 = 0.0
+    else:
+        ev_per_100 = 0.0
+        risk_per_100 = 100.0
 
     # --- Vol/Liq ratio ---
     vol_liq = round(volume / liquidity, 1) if liquidity > 0 else 999
-    thin = liquidity < 2000 or vol_liq > 20
+    thin = liquidity < 10000 or vol_liq > 20
 
     # --- Composite score ---
-    score = compute_score(max_price, deviation, days_left, liquidity)
+    score = compute_score(deviation, price_sum, max_price, days_left, liquidity)
 
     return {
         "tier": tier,
@@ -330,7 +366,10 @@ def process_market(m: dict, now: datetime) -> dict | None:
         "trade_side_class": trade_side_class,
         "profit_100": profit_100,
         "ann_roi": ann_roi,
+        "ann_roi_capped": ann_roi >= MAX_ANN_ROI,
         "guaranteed": is_guaranteed,
+        "ev_per_100": ev_per_100,
+        "risk_per_100": risk_per_100,
         "score": score,
         "category": category,
         "num_outcomes": num_outcomes,
@@ -575,7 +614,11 @@ button{font-family:var(--font);cursor:pointer}
 .trade-profit{font-size:13px;font-weight:700;color:var(--pm-green);font-variant-numeric:tabular-nums}
 .trade-per{font-size:11px;color:var(--pm-text-tertiary);margin-left:-4px}
 .trade-ann{font-size:11px;color:var(--pm-text-secondary);margin-left:auto;white-space:nowrap}
-.trade-guaranteed{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:var(--pm-blue-bg);color:var(--pm-blue);text-transform:uppercase;letter-spacing:.4px}
+.trade-guaranteed{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:var(--pm-green-soft);color:var(--pm-green);text-transform:uppercase;letter-spacing:.4px}
+.trade-speculative{font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:var(--pm-orange-soft);color:var(--pm-orange);text-transform:uppercase;letter-spacing:.4px}
+.trade-ev{font-size:10px;padding:2px 7px;border-radius:var(--r-xs);white-space:nowrap}
+.trade-ev-pos{font-weight:600;background:var(--pm-green-soft);color:var(--pm-green)}
+.trade-ev-zero{font-weight:500;background:var(--pm-bg-elevated);color:var(--pm-text-tertiary)}
 
 /* footer */
 .card-footer{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}
@@ -680,24 +723,24 @@ button{font-family:var(--font);cursor:pointer}
   <div id="content" style="display:none">
     <div class="tier-section tier-super" id="sec-super">
       <div class="tier-header">
-        <span class="tier-icon">&#128293;</span>
-        <span class="tier-label">Super Interessant</span>
+        <span class="tier-icon">&#9989;</span>
+        <span class="tier-label">Gain Garanti</span>
         <span class="tier-count" id="cnt-super">0</span>
       </div>
       <div class="card-grid" id="tier-super"></div>
     </div>
     <div class="tier-section tier-int" id="sec-int">
       <div class="tier-header">
-        <span class="tier-icon">&#128064;</span>
-        <span class="tier-label">Interessant</span>
+        <span class="tier-icon">&#127919;</span>
+        <span class="tier-label">Forte Probabilite</span>
         <span class="tier-count" id="cnt-int">0</span>
       </div>
       <div class="card-grid" id="tier-int"></div>
     </div>
     <div class="tier-section tier-watch" id="sec-watch">
       <div class="tier-header">
-        <span class="tier-icon">&#128203;</span>
-        <span class="tier-label">A Regarder</span>
+        <span class="tier-icon">&#128064;</span>
+        <span class="tier-label">A Surveiller</span>
         <span class="tier-count" id="cnt-watch">0</span>
       </div>
       <div class="card-grid" id="tier-watch"></div>
@@ -800,8 +843,14 @@ function renderCard(item){
   var tr='<span class="trade-action '+tCls+'">'+esc(item.trade_label)+'</span>'
     +'<span class="trade-profit">+$'+item.profit_100.toFixed(2)+'</span>'
     +'<span class="trade-per">/ $100</span>'
-    +'<span class="trade-ann">'+fmtRoi(item.ann_roi)+' ann.</span>';
-  if(item.guaranteed)tr+='<span class="trade-guaranteed">GARANTI</span>';
+    +'<span class="trade-ann">'+(item.ann_roi_capped?'&ge;':'')+fmtRoi(item.ann_roi)+' ann.</span>';
+  if(item.guaranteed){
+    tr+='<span class="trade-guaranteed">GARANTI</span>';
+    tr+='<span class="trade-ev trade-ev-pos">EV +$'+item.ev_per_100.toFixed(2)+'</span>';
+  }else{
+    tr+='<span class="trade-speculative">SPECULATIF</span>';
+    tr+='<span class="trade-ev trade-ev-zero">EV ~$0 &middot; Risque -$'+item.risk_per_100.toFixed(0)+'</span>';
+  }
 
   /* stats */
   var st='<span>Vol <strong>'+fmtMoney(item.volume)+'</strong></span>';
