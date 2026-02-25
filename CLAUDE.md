@@ -22,33 +22,40 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 ### 3 Tiers
 | Tier | Label | Criteria | Edge |
 |------|-------|----------|------|
-| **super** | Gain Garanti | Arb with deviation > 3% | Guaranteed profit |
-| **interesting** | Forte Probabilite | Arb 1-3% OR max_price > 90% | Arb = guaranteed, near-certain = speculative |
-| **watch** | A Surveiller | Micro arb 0.5-1% OR 80-90% OR overround > 4% | Low edge or informational |
+| **super** | Gain Garanti | Arb with deviation > 4% | Guaranteed profit after fees |
+| **interesting** | Petit Arb | Arb 2-4% | Guaranteed profit, tighter margin |
+| **watch** | Speculatif | max_price > 90% (near-certain) | EV ≈ $0, involves luck |
+
+**Removed**: Overround (sum > 1.0) excluded entirely — margin against you, not an opportunity.
+**Removed**: Arbs < 2% — unprofitable after ~2% trading fees.
+**Removed**: 80-90% probability — too speculative for "no luck" objective.
 
 ### Scoring Formula
 `score = edge × (1/days_left) × log(liquidity)`
-- **Arb edge** = `deviation × 20` (bigger gap = better)
-- **Near-certain edge** = `(max_price - 0.70) × 0.3` (reduced weight — no real edge)
-- **Overround edge** = `deviation × 2` (low priority)
+- **Arb edge** = `deviation × 50` (dominant weight — real edge)
+- **Near-certain edge** = `(max_price - 0.70) × 0.1` (minimal weight — no real edge)
 
 ### Key Thresholds
 - `MIN_LIQUIDITY = 5000` — markets below $5K liquidity are unexecutable
 - `MIN_VOLUME = 1000` — minimum lifetime volume
 - `MAX_ANN_ROI = 1000.0` — cap annualized ROI to avoid absurd display
+- `EST_FEE_PCT = 2.0` — estimated round-trip trading fees
 - `max_price > 0.995` → filtered (negligible profit)
 - Volume 24h = 0 (when data available) → filtered as dead market
+- Arb deviation < 2% → filtered (unprofitable after fees)
 
 ### EV Display
-- **Arbs**: `EV +$X.XX garanti` (guaranteed, risk = $0)
-- **Non-arbs**: `EV ~$0 · Risque -$100` (honest risk/reward)
-- **GARANTI** badge for arbs, **SPECULATIF** badge for everything else
+- **Arbs**: `+$X.XX / $100` gross profit + `Net ~$Y.YY (frais ~2%)` after fees
+- **Non-arbs**: no profit shown — only `EV ~$0 · Risque -$100`
+- **GARANTI** badge (green) for arbs, **SPECULATIF** badge (orange) for non-arbs
+- **Warning**: `⚠ N trades requis` for arbs (execution risk)
 
 ## Key Design Decisions
 - **Crypto filter**: Regex with ONLY unambiguous tokens — short tokens like `sol`, `eth`, `ada`, `link`, `dot` were intentionally REMOVED because they cause false positives on words like "resolution", "whether", "Canada"
 - **Question NOT truncated** in backend — CSS `-webkit-line-clamp` handles display truncation
 - **Design system**: Polymarket brand identity — primary blue `#2e5cff`, green `#47c97a` (Yes), red `#ff6464` (No), dark bg `#12151f`, font Open Sauce One / Inter
-- **Overround ≠ mispricing**: sum > 1.0 is the market's margin (like a bookmaker's vig), NOT an arbitrage opportunity
+- **Overround excluded**: sum > 1.0 is the market's margin — excluded entirely (not shown)
+- **Fees estimated at ~2%**: arb profit shown net of estimated fees
 
 ## Testing
 **ALWAYS run tests before committing**:
@@ -56,12 +63,12 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 python -m pytest tests/ -v
 ```
 
-Test file: `tests/test_scanner.py` (108 tests) — covers:
-- classify(): arb tiers (super/interesting/watch), near-certain, overround, boundaries, priority rules
-- compute_score(): arb >> near-certain, edge-based ranking, time/liquidity weighting
+Test file: `tests/test_scanner.py` (112 tests) — covers:
+- classify(): arb tiers (super/interesting), near-certain watch-only, overround excluded, boundaries
+- compute_score(): arb >> near-certain (10x+), edge-based ranking, time/liquidity weighting
 - Crypto regex: 10 true positives + 10 false-positive guards
 - Category extraction: 8 categories + tag priority + fallback
-- process_market() pipeline: arb detection + EV, near-certain + risk, overround, ROI cap, volume 24h filter, thin detection, multi-outcome, all filters, edge cases
+- process_market() pipeline: arb detection + EV + fees + net, near-certain risk, ROI cap, volume 24h filter, thin detection, multi-outcome arb labels, all filters, edge cases
 
 ## File Structure
 ```

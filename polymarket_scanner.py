@@ -36,6 +36,7 @@ MIN_VOLUME = 1000
 MIN_LIQUIDITY = 5000
 CACHE_TTL = 25          # seconds
 MAX_ANN_ROI = 1000.0    # cap annualized ROI to avoid absurd display
+EST_FEE_PCT = 2.0       # estimated round-trip trading fees (%)
 PORT = 5000
 
 # Crypto filter — ONLY unambiguous tokens
@@ -166,31 +167,24 @@ def classify(max_price: float, deviation: float,
              price_sum: float) -> tuple[str | None, str, str]:
     """Classify opportunity: (tier, reason_label, reason_type) or (None,'','').
 
-    Philosophy: only REAL edge matters.
-    - arbitrage (sum < 1.0) = guaranteed profit → top priority
-    - overround (sum > 1.0) = market margin, informational only
-    - near_certain = high probability, fairly priced (EV ≈ 0)
+    Philosophy: only REAL edge, no luck.
+    - arbitrage (sum < 1.0, >2%) = guaranteed profit → super/interesting
+    - near_certain (>90%) = EV ≈ $0, involves luck → watch only
+    - overround (sum > 1.0) = excluded (margin against you)
+    - arbs <2% excluded (unprofitable after ~2% fees)
     """
     if max_price > 0.995:
         return (None, "", "")  # Too certain — negligible profit
 
-    # --- Guaranteed arbitrage (sum < 1.0) — REAL edge ---
-    if price_sum < 1.0 and deviation > 0.03:
+    # --- Guaranteed arbitrage (sum < 1.0, min 2% to cover fees) ---
+    if price_sum < 1.0 and deviation > 0.04:
         return ("super", "Arb garanti", "arbitrage")
-    if price_sum < 1.0 and deviation > 0.01:
+    if price_sum < 1.0 and deviation > 0.02:
         return ("interesting", "Petit arb", "arbitrage")
-    if price_sum < 1.0 and deviation > 0.005:
-        return ("watch", "Micro arb", "arbitrage")
 
-    # --- Overround (sum > 1.0) = market margin, NOT an opportunity ---
-    if price_sum > 1.0 and deviation > 0.04:
-        return ("watch", "Overround", "overround")
-
-    # --- Near-certain (fairly priced, EV ≈ 0, high probability) ---
+    # --- Near-certain (EV ≈ $0, involves luck) → watch only ---
     if max_price > 0.90:
-        return ("interesting", "Haute proba", "near_certain")
-    if max_price > 0.80:
-        return ("watch", "Proba moderee", "near_certain")
+        return ("watch", "Haute proba", "near_certain")
 
     return (None, "", "")
 
@@ -198,12 +192,10 @@ def classify(max_price: float, deviation: float,
 def compute_score(deviation: float, price_sum: float, max_price: float,
                   days_left: float, liquidity: float) -> float:
     """Score by attractiveness. Arbs (real edge) >> near-certain (no edge)."""
-    if price_sum < 1.0 and deviation > 0.005:
-        edge = deviation * 20          # arb: bigger gap = better
-    elif price_sum > 1.0 and deviation > 0.04:
-        edge = deviation * 2           # overround: low priority
+    if price_sum < 1.0 and deviation > 0.02:
+        edge = deviation * 50          # arb: dominant weight
     else:
-        edge = max(max_price - 0.70, 0) * 0.3  # near-certain: reduced weight
+        edge = max(max_price - 0.70, 0) * 0.1  # near-certain: minimal weight
     time_f = 1.0 / max(days_left, 0.08)
     liq_f = min(math.log10(max(liquidity, 1)) / 6.0, 1.0)
     return round(edge * time_f * liq_f * 10000, 1)
@@ -305,25 +297,20 @@ def process_market(m: dict, now: datetime) -> dict | None:
 
     # --- Trade recommendation ---
     if reason_type == "arbitrage":
-        trade_label = f"ARB: BUY ALL @ {int(price_sum * 100)}\u00a2"
+        if num_outcomes == 2:
+            trade_label = f"ARB: BUY ALL @ {int(price_sum * 100)}\u00a2"
+        else:
+            trade_label = f"ARB: BUY {num_outcomes}\u00d7 @ {int(price_sum * 100)}\u00a2"
         trade_side_class = "arb"
         buy_price = price_sum
         is_guaranteed = True
-    elif reason_type == "overround":
-        cheap_idx = min(range(num_outcomes), key=lambda i: float_prices[i])
-        cheap_name = outcomes[cheap_idx] if cheap_idx < len(outcomes) else f"Out.{cheap_idx + 1}"
-        cheap_price = float_prices[cheap_idx]
-        trade_label = f"BUY {truncate(cheap_name.upper(), 12)} @ {int(cheap_price * 100)}\u00a2"
-        trade_side_class = "yes" if cheap_idx == 0 else "no"
-        buy_price = cheap_price
-        is_guaranteed = False
     else:
         trade_label = f"BUY {truncate(max_outcome_name.upper(), 12)} @ {int(max_price * 100)}\u00a2"
         trade_side_class = "yes" if (max_idx == 0 or not is_binary) else "no"
         buy_price = max_price
         is_guaranteed = False
 
-    # --- Profit, ROI, EV ---
+    # --- Profit, ROI, EV, Fees ---
     profit_100 = round(100 * (1.0 / buy_price - 1.0), 2) if buy_price > 0 else 0
     roi_pct = (1.0 / buy_price - 1.0) * 100 if buy_price > 0 else 0
     ann_roi = min(round(roi_pct * (365.0 / max(days_left, 0.04)), 1), MAX_ANN_ROI)
@@ -331,9 +318,15 @@ def process_market(m: dict, now: datetime) -> dict | None:
     if reason_type == "arbitrage":
         ev_per_100 = round((1.0 - price_sum) / price_sum * 100, 2) if price_sum > 0 else 0
         risk_per_100 = 0.0
+        fee_per_100 = round(EST_FEE_PCT, 2)
+        net_per_100 = round(ev_per_100 - fee_per_100, 2)
+        arb_warning = f"{num_outcomes} trades requis"
     else:
         ev_per_100 = 0.0
         risk_per_100 = 100.0
+        fee_per_100 = 0.0
+        net_per_100 = 0.0
+        arb_warning = ""
 
     # --- Vol/Liq ratio ---
     vol_liq = round(volume / liquidity, 1) if liquidity > 0 else 999
@@ -370,6 +363,9 @@ def process_market(m: dict, now: datetime) -> dict | None:
         "guaranteed": is_guaranteed,
         "ev_per_100": ev_per_100,
         "risk_per_100": risk_per_100,
+        "fee_per_100": fee_per_100,
+        "net_per_100": net_per_100,
+        "arb_warning": arb_warning,
         "score": score,
         "category": category,
         "num_outcomes": num_outcomes,
@@ -619,6 +615,7 @@ button{font-family:var(--font);cursor:pointer}
 .trade-ev{font-size:10px;padding:2px 7px;border-radius:var(--r-xs);white-space:nowrap}
 .trade-ev-pos{font-weight:600;background:var(--pm-green-soft);color:var(--pm-green)}
 .trade-ev-zero{font-weight:500;background:var(--pm-bg-elevated);color:var(--pm-text-tertiary)}
+.trade-warning{width:100%;font-size:10px;color:var(--pm-orange);font-weight:500;margin-top:2px}
 
 /* footer */
 .card-footer{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}
@@ -731,8 +728,8 @@ button{font-family:var(--font);cursor:pointer}
     </div>
     <div class="tier-section tier-int" id="sec-int">
       <div class="tier-header">
-        <span class="tier-icon">&#127919;</span>
-        <span class="tier-label">Forte Probabilite</span>
+        <span class="tier-icon">&#128176;</span>
+        <span class="tier-label">Petit Arb</span>
         <span class="tier-count" id="cnt-int">0</span>
       </div>
       <div class="card-grid" id="tier-int"></div>
@@ -740,7 +737,7 @@ button{font-family:var(--font);cursor:pointer}
     <div class="tier-section tier-watch" id="sec-watch">
       <div class="tier-header">
         <span class="tier-icon">&#128064;</span>
-        <span class="tier-label">A Surveiller</span>
+        <span class="tier-label">Speculatif</span>
         <span class="tier-count" id="cnt-watch">0</span>
       </div>
       <div class="card-grid" id="tier-watch"></div>
@@ -750,7 +747,7 @@ button{font-family:var(--font);cursor:pointer}
   <footer class="app-footer">
     Auto-refresh 30s &middot; Data via
     <a href="https://polymarket.com" target="_blank" rel="noopener">Polymarket</a> Gamma API
-    &middot; Paginated &middot; Cached 25s
+    &middot; Cached 25s &middot; Prix indicatifs &mdash; v&eacute;rifier le carnet d&#39;ordres
   </footer>
 </div>
 
@@ -840,16 +837,17 @@ function renderCard(item){
 
   /* trade */
   var tCls='trade-action-'+item.trade_side_class;
-  var tr='<span class="trade-action '+tCls+'">'+esc(item.trade_label)+'</span>'
-    +'<span class="trade-profit">+$'+item.profit_100.toFixed(2)+'</span>'
-    +'<span class="trade-per">/ $100</span>'
-    +'<span class="trade-ann">'+(item.ann_roi_capped?'&ge;':'')+fmtRoi(item.ann_roi)+' ann.</span>';
+  var tr='<span class="trade-action '+tCls+'">'+esc(item.trade_label)+'</span>';
   if(item.guaranteed){
-    tr+='<span class="trade-guaranteed">GARANTI</span>';
-    tr+='<span class="trade-ev trade-ev-pos">EV +$'+item.ev_per_100.toFixed(2)+'</span>';
+    tr+='<span class="trade-profit">+$'+item.profit_100.toFixed(2)+'</span>'
+      +'<span class="trade-per">/ $100</span>'
+      +'<span class="trade-ann">'+(item.ann_roi_capped?'&ge;':'')+fmtRoi(item.ann_roi)+' ann.</span>'
+      +'<span class="trade-guaranteed">GARANTI</span>'
+      +'<span class="trade-ev trade-ev-pos">Net ~$'+item.net_per_100.toFixed(2)+' (frais ~'+item.fee_per_100.toFixed(0)+'%)</span>';
+    if(item.arb_warning)tr+='<div class="trade-warning">&#9888; '+esc(item.arb_warning)+'</div>';
   }else{
-    tr+='<span class="trade-speculative">SPECULATIF</span>';
-    tr+='<span class="trade-ev trade-ev-zero">EV ~$0 &middot; Risque -$'+item.risk_per_100.toFixed(0)+'</span>';
+    tr+='<span class="trade-speculative">SPECULATIF</span>'
+      +'<span class="trade-ev trade-ev-zero">EV ~$0 &middot; Risque -$'+item.risk_per_100.toFixed(0)+'</span>';
   }
 
   /* stats */

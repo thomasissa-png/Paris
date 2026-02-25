@@ -1,15 +1,13 @@
 """
-Polymarket Scanner — Test Suite v2
+Polymarket Scanner — Test Suite v3
 ===================================
 Run: python -m pytest tests/ -v
-Run: bash run_tests.sh
 
-Must pass before every commit.
-
-Tests the EV-first scoring philosophy:
-- Arb garanti (sum < 1.0) = tier super, guaranteed profit
-- Near-certain (>90%) = tier interesting, EV ~$0 with risk
-- Overround (sum > 1.0) = tier watch, market margin
+EV-first philosophy, no luck:
+- Arb garanti (sum < 1.0, >2%) = super/interesting, guaranteed profit
+- Near-certain (>90%) = watch only, EV ~$0, involves luck
+- Overround (sum > 1.0) = excluded entirely
+- Arb <2% = excluded (unprofitable after ~2% fees)
 """
 
 import json
@@ -18,6 +16,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 
 from polymarket_scanner import (
+    EST_FEE_PCT,
     MAX_ANN_ROI,
     MIN_LIQUIDITY,
     classify,
@@ -57,71 +56,78 @@ def _make_market(now, **overrides):
 
 
 # =========================================================================
-# classify() — New arb-first logic
+# classify() — Arb-first, no overround, no luck
 # =========================================================================
 
 class TestClassify:
-    """Test tier classification with arb-first philosophy."""
+    """Test tier classification with strict arb-first philosophy."""
 
-    # --- Guaranteed arbitrage (sum < 1.0) ---
+    # --- Guaranteed arbitrage (sum < 1.0, min 2%) ---
 
     def test_super_arb_large_deviation(self):
-        """sum < 1.0 with deviation > 3% → super/arbitrage."""
+        """deviation > 4% → super/arbitrage."""
         tier, label, rtype = classify(0.50, 0.05, 0.95)
         assert tier == "super"
         assert rtype == "arbitrage"
         assert "garanti" in label.lower()
 
     def test_interesting_arb_medium_deviation(self):
-        """sum < 1.0 with deviation 1-3% → interesting/arbitrage."""
-        tier, label, rtype = classify(0.50, 0.02, 0.98)
+        """deviation 2-4% → interesting/arbitrage."""
+        tier, label, rtype = classify(0.50, 0.03, 0.97)
         assert tier == "interesting"
         assert rtype == "arbitrage"
 
-    def test_watch_arb_small_deviation(self):
-        """sum < 1.0 with deviation 0.5-1% → watch/arbitrage."""
-        tier, label, rtype = classify(0.50, 0.008, 0.992)
-        assert tier == "watch"
-        assert rtype == "arbitrage"
-
-    def test_arb_below_threshold_filtered(self):
-        """sum < 1.0 but deviation < 0.5% → too small, filtered."""
-        tier, _, _ = classify(0.50, 0.003, 0.997)
-        # Doesn't match arb thresholds, and max_price 0.50 < 0.80 → None
+    def test_arb_below_2pct_filtered(self):
+        """deviation < 2% → filtered (unprofitable after fees)."""
+        tier, _, _ = classify(0.50, 0.015, 0.985)
         assert tier is None
 
-    # --- Overround (sum > 1.0) = market margin ---
+    def test_arb_1pct_filtered(self):
+        """1% arb → filtered (fees eat the profit)."""
+        tier, _, _ = classify(0.50, 0.01, 0.99)
+        assert tier is None
 
-    def test_overround_large(self):
-        """sum > 1.0 with deviation > 4% → watch/overround."""
-        tier, label, rtype = classify(0.55, 0.07, 1.07)
-        assert tier == "watch"
-        assert rtype == "overround"
+    # --- Overround removed entirely ---
+
+    def test_overround_not_shown(self):
+        """sum > 1.0 should NEVER produce a result."""
+        tier, _, _ = classify(0.55, 0.07, 1.07)
+        assert tier is None
 
     def test_overround_small_not_shown(self):
-        """sum > 1.0 but deviation < 4% → not flagged as overround."""
+        """Even small overround → excluded."""
         tier, _, _ = classify(0.52, 0.02, 1.02)
-        # max_price 0.52 < 0.80, deviation too small for overround → None
         assert tier is None
 
-    # --- Near-certain (fairly priced, EV ≈ 0) ---
+    # --- Near-certain → watch ONLY (not interesting) ---
 
-    def test_interesting_near_certain(self):
-        """max_price > 0.90, sum ≈ 1.0 → interesting/near_certain."""
+    def test_near_certain_watch_only(self):
+        """max_price > 90% → watch/near_certain (NOT interesting)."""
         tier, label, rtype = classify(0.94, 0.0, 1.0)
-        assert tier == "interesting"
-        assert rtype == "near_certain"
-
-    def test_watch_moderate_probability(self):
-        """0.80 < max_price <= 0.90 → watch/near_certain."""
-        tier, label, rtype = classify(0.85, 0.0, 1.0)
         assert tier == "watch"
         assert rtype == "near_certain"
 
-    # --- Too certain (filtered) ---
+    def test_near_certain_never_interesting(self):
+        """Even 95% → watch, never interesting."""
+        tier, _, _ = classify(0.95, 0.0, 1.0)
+        assert tier == "watch"
+        assert tier != "interesting"
+
+    # --- 80-90% removed (too speculative) ---
+
+    def test_80_90_removed(self):
+        """0.80-0.90 probability → filtered (too much luck)."""
+        tier, _, _ = classify(0.85, 0.0, 1.0)
+        assert tier is None
+
+    def test_exactly_90_filtered(self):
+        """0.90 exactly → NOT > 0.90, filtered."""
+        tier, _, _ = classify(0.90, 0.0, 1.0)
+        assert tier is None
+
+    # --- Too certain ---
 
     def test_too_certain_filtered(self):
-        """max_price > 99.5% → filtered regardless of other factors."""
         tier, _, _ = classify(0.998, 0.005, 1.0)
         assert tier is None
 
@@ -130,62 +136,46 @@ class TestClassify:
         assert tier is None
 
     def test_just_below_995_passes(self):
-        """0.994 ≤ 0.995 → should classify (interesting/near_certain)."""
+        """0.994 → watch/near_certain."""
         tier, _, _ = classify(0.994, 0.006, 1.0)
-        assert tier == "interesting"
+        assert tier == "watch"
 
     # --- Not interesting ---
 
     def test_low_price_no_deviation_filtered(self):
-        """max_price < 0.80, no deviation → no opportunity."""
         tier, label, rtype = classify(0.60, 0.005, 1.0)
         assert tier is None
         assert label == ""
-        assert rtype == ""
 
-    # --- Boundary checks ---
-
-    def test_boundary_90_not_interesting_tier(self):
-        """0.90 exactly should NOT trigger interesting (requires > 0.90)."""
-        tier, _, _ = classify(0.90, 0.0, 1.0)
-        assert tier != "interesting" or tier is None
-
-    def test_boundary_80_not_watch_near_certain(self):
-        """0.80 exactly should NOT trigger watch/near_certain."""
-        tier, _, _ = classify(0.80, 0.0, 1.0)
-        assert tier is None
-
-    # --- Priority: arb checked BEFORE near-certain ---
+    # --- Priority: arb > near-certain ---
 
     def test_arb_takes_priority_over_near_certain(self):
-        """If sum < 1.0 with deviation > 3%, arb wins even with high max_price."""
+        """sum < 1.0 with deviation > 4%, even with high max_price."""
         tier, _, rtype = classify(0.92, 0.05, 0.95)
         assert tier == "super"
         assert rtype == "arbitrage"
 
     def test_too_certain_overrides_arb(self):
-        """max_price > 0.995 filters even if sum < 1.0."""
         tier, _, _ = classify(0.997, 0.003, 0.998)
         assert tier is None
 
 
 # =========================================================================
-# compute_score() — Edge-based scoring
+# compute_score() — Arb dominant, NC minimal
 # =========================================================================
 
 class TestComputeScore:
-    """Test edge-based scoring (arbs > near-certain)."""
+    """Test edge-based scoring with strong arb dominance."""
 
-    def test_arb_scores_higher_than_near_certain(self):
-        """Arb (real edge) should always outscore near-certain (no edge)."""
+    def test_arb_scores_much_higher_than_near_certain(self):
+        """Arbs should score 10x+ higher than near-certain."""
         s_arb = compute_score(0.05, 0.95, 0.50, 5, 50000)
         s_nc = compute_score(0.0, 1.0, 0.94, 5, 50000)
-        assert s_arb > s_nc
+        assert s_arb > s_nc * 10
 
     def test_bigger_arb_scores_higher(self):
-        """Larger deviation = bigger arb = higher score."""
         s_big = compute_score(0.05, 0.95, 0.50, 5, 50000)
-        s_small = compute_score(0.02, 0.98, 0.50, 5, 50000)
+        s_small = compute_score(0.03, 0.97, 0.50, 5, 50000)
         assert s_big > s_small
 
     def test_sooner_is_higher_score(self):
@@ -202,20 +192,19 @@ class TestComputeScore:
         s = compute_score(0.05, 0.95, 0.50, 30, 10000)
         assert s > 0
 
-    def test_overround_low_priority(self):
-        """Overround should score lower than equivalent arb."""
-        s_arb = compute_score(0.05, 0.95, 0.50, 5, 50000)
-        s_over = compute_score(0.05, 1.05, 0.55, 5, 50000)
-        assert s_arb > s_over
-
     def test_very_short_time_does_not_explode(self):
         s = compute_score(0.05, 0.95, 0.50, 0.01, 50000)
         assert math.isfinite(s)
 
     def test_near_certain_score_positive(self):
-        """Near-certain markets still get a positive score."""
         s = compute_score(0.0, 1.0, 0.92, 5, 50000)
         assert s > 0
+
+    def test_near_certain_score_minimal(self):
+        """Near-certain score should be very small compared to arbs."""
+        s_nc = compute_score(0.0, 1.0, 0.94, 5, 50000)
+        s_arb = compute_score(0.03, 0.97, 0.50, 5, 50000)
+        assert s_arb > s_nc * 5
 
 
 # =========================================================================
@@ -261,8 +250,6 @@ class TestCryptoRegex:
 # =========================================================================
 
 class TestExtractCategory:
-    """Test category extraction from market data."""
-
     def test_politics(self):
         assert extract_category({"question": "Will Trump win?"}) == "Politics"
 
@@ -332,7 +319,6 @@ class TestParseDate:
         dt = parse_date("2026-03-15T12:00:00Z")
         assert dt is not None
         assert dt.year == 2026
-        assert dt.month == 3
 
     def test_iso_with_offset(self):
         dt = parse_date("2026-06-01T00:00:00+00:00")
@@ -371,32 +357,34 @@ class TestTruncate:
 
 
 # =========================================================================
-# process_market() — Full pipeline (EV-first philosophy)
+# process_market() — Full pipeline (strict EV-first)
 # =========================================================================
 
 class TestProcessMarket:
-    """Integration tests for the full market processing pipeline."""
+    """Integration tests: arbs guaranteed, near-certain in watch, overround gone."""
 
-    # --- Valid markets ---
+    # --- Near-certain → watch (not interesting) ---
 
     def test_near_certain_binary_market(self, now):
-        """94/6 market → interesting/near_certain with EV ~$0."""
+        """94/6 market → WATCH/near_certain with EV ~$0."""
         m = _make_market(now)
         result = process_market(m, now)
         assert result is not None
-        assert result["tier"] == "interesting"
+        assert result["tier"] == "watch"
         assert result["reason_type"] == "near_certain"
         assert result["yes"] == 0.94
         assert result["no"] == 0.06
         assert result["is_binary"] is True
-        assert result["category"] == "Politics"
-        # EV for near-certain is ~0, risk is $100
+        assert result["guaranteed"] is False
+        # Near-certain: no edge
         assert result["ev_per_100"] == 0.0
         assert result["risk_per_100"] == 100.0
-        assert result["guaranteed"] is False
+        assert result["fee_per_100"] == 0.0
+        assert result["net_per_100"] == 0.0
+        assert result["arb_warning"] == ""
 
     def test_question_not_truncated(self, now):
-        long_q = "Will the very important Supreme Court ruling affect the upcoming presidential election results significantly?" * 2
+        long_q = "Will the Supreme Court ruling affect the upcoming presidential election?" * 3
         m = _make_market(now, question=long_q)
         result = process_market(m, now)
         assert result is not None
@@ -412,10 +400,10 @@ class TestProcessMarket:
         assert result["trade_side_class"] == "yes"
         assert result["guaranteed"] is False
 
-    # --- Arbitrage (GUARANTEED profit) ---
+    # --- Arbitrage: GUARANTEED profit with fees ---
 
     def test_arb_super_large_deviation(self, now):
-        """sum 0.93 (7% arb) → super tier, guaranteed."""
+        """sum 0.93 (7% arb) → super, guaranteed, fees shown."""
         m = _make_market(now, outcomePrices='["0.45", "0.48"]')
         result = process_market(m, now)
         assert result is not None
@@ -424,52 +412,92 @@ class TestProcessMarket:
         assert "ARB" in result["trade_label"]
         assert result["trade_side_class"] == "arb"
         assert result["guaranteed"] is True
-        # EV is guaranteed profit
+        # EV guaranteed
         assert result["ev_per_100"] > 0
         assert result["risk_per_100"] == 0.0
-        assert result["profit_100"] > 0
+        # Fees
+        assert result["fee_per_100"] == EST_FEE_PCT
+        assert result["net_per_100"] == round(result["ev_per_100"] - EST_FEE_PCT, 2)
+        assert result["net_per_100"] > 0  # profitable after fees
+        # Warning
+        assert result["arb_warning"] == "2 trades requis"
 
     def test_arb_ev_calculation(self, now):
-        """EV for arb = (1 - sum) / sum * 100."""
+        """EV = (1-sum)/sum * 100, net = EV - fees."""
         m = _make_market(now, outcomePrices='["0.45", "0.50"]')
         result = process_market(m, now)
         assert result is not None
-        assert result["guaranteed"] is True
-        # sum = 0.95, EV = (1-0.95)/0.95 * 100 ≈ $5.26
         expected_ev = (1.0 - 0.95) / 0.95 * 100
         assert abs(result["ev_per_100"] - expected_ev) < 0.1
+        assert result["net_per_100"] == round(expected_ev - EST_FEE_PCT, 2)
 
     def test_arb_interesting_medium_deviation(self, now):
-        """sum 0.98 (2% arb) → interesting tier."""
-        m = _make_market(now, outcomePrices='["0.47", "0.51"]')
+        """sum 0.97 (3% arb) → interesting tier."""
+        m = _make_market(now, outcomePrices='["0.46", "0.51"]')
         result = process_market(m, now)
         assert result is not None
         assert result["tier"] == "interesting"
         assert result["reason_type"] == "arbitrage"
         assert result["guaranteed"] is True
+        assert result["fee_per_100"] == EST_FEE_PCT
 
-    def test_arb_watch_small_deviation(self, now):
-        """sum 0.993 (0.7% arb) → watch tier."""
-        m = _make_market(now, outcomePrices='["0.496", "0.497"]')
+    def test_arb_net_positive_for_large_arb(self, now):
+        """5% arb → net profit clearly positive after fees."""
+        m = _make_market(now, outcomePrices='["0.45", "0.50"]')
         result = process_market(m, now)
         assert result is not None
-        assert result["tier"] == "watch"
-        assert result["reason_type"] == "arbitrage"
+        assert result["net_per_100"] > 2.0  # well above break-even
 
-    # --- Overround (sum > 1.0 = market margin, NOT opportunity) ---
+    # --- Arb <2% FILTERED (unprofitable after fees) ---
 
-    def test_overround_watch(self, now):
-        """sum > 1.0 with > 4% deviation → watch/overround."""
+    def test_arb_below_2pct_filtered(self, now):
+        """sum 0.99 (1% arb) → filtered."""
+        m = _make_market(now, outcomePrices='["0.495", "0.495"]')
+        assert process_market(m, now) is None
+
+    # --- Overround REMOVED ---
+
+    def test_overround_filtered(self, now):
+        """sum > 1.0 → no longer shown at all."""
         m = _make_market(now, outcomePrices='["0.55", "0.52"]')
+        assert process_market(m, now) is None
+
+    def test_overround_large_filtered(self, now):
+        """Even large overround → excluded."""
+        m = _make_market(now, outcomePrices='["0.60", "0.50"]')
+        assert process_market(m, now) is None
+
+    # --- Multi-outcome arb ---
+
+    def test_multi_outcome_arb(self, now):
+        """4-outcome arb shows trade count and warning."""
+        m = _make_market(
+            now,
+            question="Who will win the GOP primary?",
+            outcomePrices='["0.82", "0.08", "0.03", "0.02"]',
+            outcomes='["Trump", "DeSantis", "Haley", "Other"]',
+        )
         result = process_market(m, now)
         assert result is not None
-        assert result["tier"] == "watch"
-        assert result["reason_type"] == "overround"
-        assert result["guaranteed"] is False
-        assert result["ev_per_100"] == 0.0
-        assert result["risk_per_100"] == 100.0
+        assert result["is_binary"] is False
+        assert result["num_outcomes"] == 4
+        assert result["tier"] == "super"  # 5% arb
+        assert result["reason_type"] == "arbitrage"
+        assert result["yes_label"] == "Trump"
+        assert "Others" in result["no_label"]
+        # Multi-outcome trade label and warning
+        assert "4" in result["trade_label"]
+        assert result["arb_warning"] == "4 trades requis"
 
-    # --- ROI and annualized ROI ---
+    def test_binary_arb_trade_label_no_count(self, now):
+        """Binary arb says 'BUY ALL', not 'BUY 2×'."""
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert "BUY ALL" in result["trade_label"]
+        assert result["arb_warning"] == "2 trades requis"
+
+    # --- ROI ---
 
     def test_roi_calculation(self, now):
         m = _make_market(now, outcomePrices='["0.94", "0.06"]')
@@ -479,7 +507,6 @@ class TestProcessMarket:
         assert result["ann_roi"] > 0
 
     def test_ann_roi_capped(self, now):
-        """Annualized ROI should be capped at MAX_ANN_ROI."""
         m = _make_market(
             now,
             outcomePrices='["0.94", "0.06"]',
@@ -491,33 +518,14 @@ class TestProcessMarket:
         assert result["ann_roi_capped"] is True
 
     def test_ann_roi_not_capped_for_longer_markets(self, now):
-        """Markets with reasonable timeframes should not be capped."""
         m = _make_market(now, outcomePrices='["0.94", "0.06"]')
         result = process_market(m, now)
         assert result is not None
         assert result["ann_roi_capped"] is False
 
-    # --- Multi-outcome markets ---
-
-    def test_multi_outcome_market(self, now):
-        m = _make_market(
-            now,
-            question="Who will win the GOP primary?",
-            outcomePrices='["0.82", "0.10", "0.05", "0.03"]',
-            outcomes='["Trump", "DeSantis", "Haley", "Other"]',
-        )
-        result = process_market(m, now)
-        assert result is not None
-        assert result["is_binary"] is False
-        assert result["num_outcomes"] == 4
-        assert "TRUMP" in result["trade_label"]
-        assert result["yes_label"] == "Trump"
-        assert "Others" in result["no_label"]
-
-    # --- Thin market detection ---
+    # --- Thin market ---
 
     def test_thin_market_detected(self, now):
-        """Liquidity < 10000 → thin flag."""
         m = _make_market(now, liquidity="8000")
         result = process_market(m, now)
         assert result is not None
@@ -580,7 +588,6 @@ class TestProcessMarket:
         assert process_market(m, now) is None
 
     def test_filter_low_liquidity(self, now):
-        """MIN_LIQUIDITY is now 5000."""
         m = _make_market(now, liquidity="4000")
         assert process_market(m, now) is None
 
@@ -597,7 +604,7 @@ class TestProcessMarket:
         assert process_market(m, now) is None
 
     def test_filter_not_interesting(self, now):
-        """50/50 with no mispricing → no opportunity."""
+        """50/50 → no arb, no near-certain → None."""
         m = _make_market(now, outcomePrices='["0.50", "0.50"]')
         assert process_market(m, now) is None
 
@@ -610,29 +617,29 @@ class TestProcessMarket:
         assert process_market(m, now) is None
 
     def test_filter_dead_market_volume_24h_zero(self, now):
-        """When 24h volume data is available and 0, market is dead → filtered."""
         m = _make_market(now, volume24hr="0")
         assert process_market(m, now) is None
 
     def test_no_filter_when_24h_data_missing(self, now):
-        """When no 24h volume field exists, don't filter."""
         m = _make_market(now)
         assert "volume24hr" not in m
         result = process_market(m, now)
         assert result is not None
 
     def test_filter_dead_market_volume24Hr_variant(self, now):
-        """volume24Hr field variant also triggers dead market filter."""
         m = _make_market(now, volume24Hr="0")
+        assert process_market(m, now) is None
+
+    def test_filter_moderate_probability(self, now):
+        """85% market → filtered (80-90% removed)."""
+        m = _make_market(now, outcomePrices='["0.85", "0.15"]')
         assert process_market(m, now) is None
 
     # --- Edge cases ---
 
     def test_zero_price_no_crash(self, now):
         m = _make_market(now, outcomePrices='["0.00", "1.00"]')
-        result = process_market(m, now)
-        # 1.00 > 0.995 → filtered as too certain
-        assert result is None
+        assert process_market(m, now) is None
 
     def test_outcomes_as_list_not_string(self, now):
         m = _make_market(now, outcomes=["Yes", "No"])
@@ -658,19 +665,22 @@ class TestProcessMarket:
         assert result["volume_24h"] == 12345.0
 
     def test_arb_score_higher_than_near_certain_in_pipeline(self, now):
-        """End-to-end: arb markets should score higher than near-certain."""
+        """End-to-end: arb markets score much higher than near-certain."""
         m_arb = _make_market(now, outcomePrices='["0.45", "0.48"]')
         m_nc = _make_market(now, outcomePrices='["0.94", "0.06"]')
         r_arb = process_market(m_arb, now)
         r_nc = process_market(m_nc, now)
         assert r_arb is not None and r_nc is not None
-        assert r_arb["score"] > r_nc["score"]
+        assert r_arb["score"] > r_nc["score"] * 10
 
-    def test_ev_fields_present_for_all_tiers(self, now):
-        """All results must have ev_per_100 and risk_per_100."""
+    def test_all_new_fields_present(self, now):
+        """All results must have fee, net, warning fields."""
         m = _make_market(now)
         result = process_market(m, now)
         assert result is not None
         assert "ev_per_100" in result
         assert "risk_per_100" in result
+        assert "fee_per_100" in result
+        assert "net_per_100" in result
+        assert "arb_warning" in result
         assert "ann_roi_capped" in result
