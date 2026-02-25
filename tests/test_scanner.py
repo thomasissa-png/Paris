@@ -86,6 +86,21 @@ class TestClassify:
         assert tier == "watch"
         assert rtype == "mispricing"
 
+    def test_too_certain_filtered(self):
+        """Markets > 99.5% offer negligible profit — should be filtered out."""
+        tier, label, rtype = classify(0.998, 0.005)
+        assert tier is None
+
+    def test_boundary_995_is_filtered(self):
+        """0.996 > 0.995 — should be filtered."""
+        tier, _, _ = classify(0.996, 0.005)
+        assert tier is None
+
+    def test_just_below_995_still_super(self):
+        """0.994 ≤ 0.995 — should still be classified as super."""
+        tier, _, _ = classify(0.994, 0.005)
+        assert tier == "super"
+
     def test_not_interesting(self):
         tier, label, rtype = classify(0.60, 0.005)
         assert tier is None
@@ -442,6 +457,11 @@ class TestProcessMarket:
         m = _make_market(now, endDate=None)
         assert process_market(m, now) is None
 
+    def test_filter_too_certain(self, now):
+        """Markets > 99.5% offer negligible profit — filtered out."""
+        m = _make_market(now, outcomePrices='["0.998", "0.002"]')
+        assert process_market(m, now) is None
+
     def test_filter_not_interesting(self, now):
         """Market at 50/50 with no mispricing should be filtered."""
         m = _make_market(now, outcomePrices='["0.50", "0.50"]')
@@ -460,8 +480,8 @@ class TestProcessMarket:
     def test_zero_price_no_crash(self, now):
         m = _make_market(now, outcomePrices='["0.00", "1.00"]')
         result = process_market(m, now)
-        # Should not crash; 1.00 max_price → super tier
-        assert result is not None
+        # 1.00 > 0.995 → filtered as too certain
+        assert result is None
 
     def test_outcomes_as_list_not_string(self, now):
         """Handle outcomes already parsed as list (not JSON string)."""

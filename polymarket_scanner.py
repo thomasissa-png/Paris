@@ -163,6 +163,8 @@ def extract_category(m: dict) -> str:
 
 def classify(max_price: float, deviation: float) -> tuple[str | None, str, str]:
     """(tier, reason_label, reason_type) or (None, '', '')."""
+    if max_price > 0.995:
+        return (None, "", "")  # Too certain — negligible profit
     if max_price > 0.90:
         return ("super", "Near-certain", "near_certain")
     if deviation > 0.04:

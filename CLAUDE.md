@@ -15,7 +15,8 @@ Single-file Flask web app (`polymarket_scanner.py`) that scans Polymarket predic
 
 ## Key Design Decisions
 - **Scoring**: Composite score = `certainty × (1/days_left) × log(liquidity)` — balances probability, urgency, and market depth
-- **3 tiers**: Super Interessant (>90% or >4% mispricing), Interessant (80-90% or 2-4%), A Regarder (70-80% or 1-2%)
+- **3 tiers**: Super Interessant (90-99.5% or >4% mispricing), Interessant (80-90% or 2-4%), A Regarder (70-80% or 1-2%)
+- **99.5% filter**: Markets above 99.5% certainty are excluded — negligible profit ($0.50 per $100)
 - **Trade recommendations**: Each card shows BUY direction + entry price + profit per $100 + annualized ROI. Arbitrage opportunities (sum < 1.0) are labeled GARANTI
 - **Crypto filter**: Regex with ONLY unambiguous tokens — short tokens like `sol`, `eth`, `ada`, `link`, `dot` were intentionally REMOVED because they cause false positives on words like "resolution", "whether", "Canada"
 - **Question NOT truncated** in backend — CSS `-webkit-line-clamp` handles display truncation
