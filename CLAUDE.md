@@ -58,7 +58,7 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 - **Warning**: `⚠ N trades requis` for arbs (execution risk)
 
 ## External Analyzers (Edge Informationnel)
-The scanner runs 3 analyzers to detect informational edge. Analyzers are **optional** — weather and sports activate with API keys, finance is always active (no key needed).
+The scanner runs 7 analyzers to detect informational edge. Analyzers are **optional** — some activate with API keys, others are always active (no key needed).
 
 ### Weather Analyzer
 - **API**: OpenWeatherMap 5-day/3h forecast (free tier: 1000 calls/day)
@@ -76,7 +76,7 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 ### Finance Analyzer
 - **API**: Yahoo Finance public chart endpoint (no API key needed — always active)
 - **Detects**: stock price threshold markets ("Will Tesla reach $X?"), index targets, commodity prices
-- **Tickers**: 20+ pre-mapped US stocks, indices (S&P, Nasdaq, Dow), commodities (gold, oil, silver)
+- **Tickers**: 50+ pre-mapped US stocks, indices (S&P, Nasdaq, Dow), commodities (gold, oil, silver, copper, platinum), forex (EUR/USD, GBP/USD, USD/JPY, USD/CNY, DXY), crypto-adjacent stocks (MSTR, MARA, RIOT)
 - **Model**: Log-normal diffusion with drift `P(S>K) = Φ(-z)` where `z = (ln(K/S) - (r-σ²/2)T) / (σ√T)`, r=4.5% annual
 - **Volatility**: EWMA (λ=0.94, RiskMetrics) from 3-month daily log returns — weights recent data more heavily
 - **Cache**: 5 min TTL per ticker, expired entries purged automatically, thread-safe
@@ -98,10 +98,50 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 ### Common Edge Properties
 - **Edge calc**: `estimated_prob - yes_price` (binary: float_prices[0]) → if |edge| > 10%, classified as "edge" tier
 - **EV formula**: `(win_prob / buy_price - 1) × 100` where win_prob = est_prob (buy Yes) or 1-est_prob (buy No)
-- **Analyzer call order**: weather → finance → sports (deterministic, first match wins)
+- **Analyzer call order**: weather → finance → earnings → sports → fed/macro → elections → crypto (deterministic, first match wins)
+
+### Earnings Analyzer
+- **API**: Yahoo Finance quoteSummary endpoint (no API key needed — always active)
+- **Detects**: "Will X beat/miss earnings?" style markets
+- **Question parsing**: keyword detection (earnings, revenue, EPS, quarterly, beat, miss, guidance)
+- **Model**: Historical beat rate from last 4 quarters of actual vs. estimated EPS
+- **Beat direction**: "beat" → use beat_rate, "miss" → 1 - beat_rate
+- **Confidence**: degrades by data quality (4Q=high, 2Q=medium, <2Q=low) AND horizon (>30d=low)
+- **Cache**: 10 min TTL per ticker, expired entries purged automatically, thread-safe
+
+### Fed/Macro Analyzer
+- **API**: FRED (Federal Reserve Economic Data) — free API key (unlimited calls)
+- **Env var**: `FRED_API_KEY`
+- **Detects**: Fed rate decisions, CPI/inflation, unemployment, GDP/recession markets
+- **Series**: DFEDTARU (Fed rate), CPALTT01USM657N (CPI YoY), UNRATE (unemployment), A191RL1Q225SBEA (GDP)
+- **Rate model**: Base rates — hold=75%, cut=30%, hike=10% (adjusted with threshold if present)
+- **Inflation/Unemployment**: Sigmoid calibration `P = 1/(1+exp(-margin/k))` where margin = data - threshold
+- **Recession**: GDP-based — negative=55%, slow(<1%)=30%, healthy=15%
+- **Works without key**: rate direction analysis still available (generic base rates)
+- **Confidence**: 0-7d = high, 7-30d = medium, 30d+ = low
+- **Cache**: 30 min TTL per series, thread-safe
+
+### Crypto Price Analyzer
+- **API**: CoinGecko public API (no API key needed — always active)
+- **Detects**: crypto price target markets ("Will Bitcoin reach $X?")
+- **Coins**: 25+ pre-mapped (bitcoin, ethereum, solana, cardano, dogecoin, etc.)
+- **Model**: Log-normal diffusion (same as finance) but with crypto-appropriate higher volatility
+- **Volatility**: Derived from 30d price change (CoinGecko market_data)
+- **Confidence**: Always medium or low (crypto too volatile for "high" confidence)
+- **Crypto gate**: Modified — crypto markets WITH price targets pass through for analysis
+- **Cache**: 5 min TTL per coin, thread-safe
+
+### Elections/Polls Analyzer
+- **API**: RealClearPolitics public polling endpoint (no API key needed)
+- **Detects**: election outcomes, approval ratings, party control markets
+- **Figures**: 10+ pre-mapped political figures (Trump, Biden, Harris, DeSantis, Newsom, etc.)
+- **Approval model**: Sigmoid `P = 1/(1+exp(-margin/2))` where margin = approval - threshold
+- **Party control**: Base rates — Senate R=55%, D=45%; House 50/50
+- **Incumbent advantage**: 55% base rate for re-election markets
+- **Confidence**: Generally low (elections are inherently uncertain)
+- **Cache**: 30 min TTL (polls update slowly), thread-safe
 
 ### Future Analyzers (architecture ready)
-- **Polls**: Polling aggregators — election/political probability vs. Polymarket
 - **Resolution**: News APIs — detect already-resolved markets not yet settled
 
 ## Key Design Decisions
@@ -110,13 +150,19 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 - **Design system**: Polymarket brand identity — primary blue `#2e5cff`, green `#47c97a` (Yes), red `#ff6464` (No), dark bg `#12151f`, font Open Sauce One / Inter
 - **Overround excluded**: sum > 1.0 is the market's margin — excluded entirely (not shown)
 - **Fees estimated at ~2%**: arb profit shown net of estimated fees
-- **External analyzers optional**: zero-config without API keys, enhanced with keys via env vars
+- **External analyzers optional**: zero-config without API keys, enhanced with keys via env vars. 4 analyzers need no key (Finance, Earnings, Crypto, Elections), 3 optional keys (Weather, Sports, FRED)
 - **Weather cache**: 10 min TTL per city, thread-safe, auto-purge expired entries, prevents API key exhaustion
 - **Finance cache**: 5 min TTL per ticker, same purge pattern
 - **Odds cache**: 5 min TTL per sport, same purge pattern
-- **Analyzer call order**: weather → finance → sports via `run_analyzers()`. Order is deterministic and documented
+- **Analyzer call order**: weather → finance → earnings → sports → fed/macro → elections → crypto via `run_analyzers()`. Order is deterministic and documented
 - **All API calls synchronous**: acceptable because caches deduplicate requests. Async would add complexity for minimal gain at current scale
-- **Finance always active**: Yahoo Finance needs no key — every scan checks stock/index markets for free
+- **Finance always active**: Yahoo Finance needs no key — every scan checks stock/index/forex/commodity/earnings markets for free
+- **Crypto analyzer active**: CoinGecko needs no key — crypto price target markets analyzed for free
+- **Elections analyzer active**: RealClearPolitics + base rates need no key — political markets analyzed for free
+- **Earnings cache**: 10 min TTL per ticker, same purge pattern
+- **FRED cache**: 30 min TTL per series (macro data moves slowly), same purge pattern
+- **Polls cache**: 30 min TTL (polls update slowly), same purge pattern
+- **Crypto cache**: 5 min TTL per coin, same purge pattern
 - **Gamma API retry**: 3 attempts per page with 1s backoff, logging warnings on partial fetches
 - **Cache single-flight**: `_scan_lock` ensures only one `scan()` runs at a time; concurrent requests wait for cached result
 - **Proportional fees**: `fee = EST_FEE_PCT × num_outcomes / 2` — multi-outcome arbs pay more fees per outcome
@@ -130,7 +176,7 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 python -m pytest tests/ -v
 ```
 
-Test file: `tests/test_scanner.py` (241 tests) — covers:
+Test file: `tests/test_scanner.py` (361 tests) — covers:
 - classify(): arb tiers (super/interesting), edge tier (before 0.995), near-certain watch-only, overround excluded, boundaries
 - compute_score(): edge > arb >> near-certain, time/liquidity weighting, confidence multiplier
 - Weather analyzer: city detection, sigmoid temp, composite rain, flexible keywords, horizon confidence, mocked OWM API
@@ -141,6 +187,14 @@ Test file: `tests/test_scanner.py` (241 tests) — covers:
 - Crypto regex: 10 true positives + 10 false-positive guards
 - Category extraction: 8 categories + tag priority + fallback
 - process_market() pipeline: arb detection + EV + fees + net, near-certain risk, ROI cap, volume 24h filter, thin detection, multi-outcome arb labels, all filters, edge cases
+- Forex/Commodities: ticker mapping (EUR/USD, GBP, YEN, DXY, copper, platinum), additional stocks (Uber, Disney, Boeing, etc.)
+- Earnings analyzer: keyword detection, beat/miss direction, confidence by data quality, mocked Yahoo Finance
+- Fed/Macro analyzer: rate decision (hold/cut/hike), CPI threshold sigmoid, unemployment, GDP/recession, FRED series config, mocked FRED API
+- Crypto analyzer: ticker mapping (25+ coins), CoinGecko price model, above/below direction, confidence always medium/low, mocked CoinGecko
+- Elections analyzer: keyword detection (election, midterm, senate, approval), political figures, party control base rates, approval threshold sigmoid, mocked RCP API
+- Updated category extraction: Finance, Crypto, Commodities, Forex, expanded Politics/Sports/Weather
+- Updated run_analyzers: 7-analyzer chain order verification, all-None fallback
+- Crypto gate: price target markets pass through, generic crypto still filtered
 - Cleanup: "la" alias removed, OWM cache purge, normal CDF helper
 
 ## File Structure

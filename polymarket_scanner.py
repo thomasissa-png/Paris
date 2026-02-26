@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Polymarket Live Opportunity Scanner v4
+Polymarket Live Opportunity Scanner v5
 =======================================
 Full trading intelligence: ROI, annualized returns, mispricing direction,
 multi-outcome support, category filtering, smart scoring.
 
-Edge informationnel — 3 analyzers detect markets where external data
+Edge informationnel — 7 analyzers detect markets where external data
 disagrees with market prices:
-  - Weather: OpenWeatherMap forecast vs. temperature/rain markets
-  - Finance: Yahoo Finance price + volatility vs. stock/index threshold markets
-  - Sports:  Bookmaker consensus odds vs. sports outcome markets
+  - Weather:    OpenWeatherMap forecast vs. temperature/rain markets
+  - Finance:    Yahoo Finance price + volatility vs. stock/index/forex/commodity markets
+  - Earnings:   Yahoo Finance earnings data vs. "beat/miss" markets
+  - Sports:     Bookmaker consensus odds vs. sports outcome markets
+  - Fed/Macro:  FRED economic data vs. rate/CPI/unemployment/GDP markets
+  - Elections:  RealClearPolitics polls vs. election/approval markets
+  - Crypto:     CoinGecko prices vs. crypto price target markets
 
 Run:  pip install -r requirements.txt && python polymarket_scanner.py
 Open: http://localhost:5000
@@ -17,6 +21,7 @@ Open: http://localhost:5000
 Optional env vars:
   OPENWEATHERMAP_API_KEY  — free key from openweathermap.org (1000 calls/day)
   THE_ODDS_API_KEY        — free key from the-odds-api.com (500 requests/month)
+  FRED_API_KEY            — free key from fred.stlouisfed.org (unlimited)
 """
 
 import json
@@ -459,13 +464,44 @@ FINANCE_TICKERS: dict[str, str] = {
     "oil": "CL=F", "crude oil": "CL=F", "wti": "CL=F",
     "silver": "SI=F",
     "natural gas": "NG=F",
+    "copper": "HG=F",
+    "platinum": "PL=F",
+    # Forex (major pairs via Yahoo Finance)
+    "euro": "EURUSD=X", "eur/usd": "EURUSD=X", "eurusd": "EURUSD=X",
+    "gbp": "GBPUSD=X", "gbp/usd": "GBPUSD=X", "british pound": "GBPUSD=X",
+    "yen": "USDJPY=X", "usd/jpy": "USDJPY=X", "usdjpy": "USDJPY=X",
+    "yuan": "USDCNY=X", "usd/cny": "USDCNY=X", "renminbi": "USDCNY=X",
+    "dollar index": "DX-Y.NYB", "dxy": "DX-Y.NYB",
+    # Additional stocks (Polymarket frequent)
+    "uber": "UBER",
+    "disney": "DIS", "dis": "DIS",
+    "intel": "INTC", "intc": "INTC",
+    "boeing": "BA",
+    "jpmorgan": "JPM", "jpm": "JPM",
+    "berkshire": "BRK-B",
+    "spotify": "SPOT",
+    "snap": "SNAP", "snapchat": "SNAP",
+    "robinhood": "HOOD",
+    "rivian": "RIVN",
+    "lucid": "LCID",
+    "affirm": "AFRM",
+    "sofi": "SOFI",
+    "crowdstrike": "CRWD",
+    "snowflake": "SNOW",
+    # Crypto-adjacent stocks (not crypto themselves)
+    "microstrategy": "MSTR", "mstr": "MSTR",
+    "marathon digital": "MARA",
+    "riot platforms": "RIOT",
 }
 
 _FINANCE_KEYWORDS_RE = re.compile(
     r"\b(?:stock|share|price|close|trading|"
-    r"s&p|nasdaq|dow|gold|oil|silver|"
+    r"s&p|nasdaq|dow|gold|oil|silver|copper|platinum|natural gas|"
+    r"euro|eur/usd|gbp|yen|yuan|dollar index|dxy|forex|currency|"
     r"tesla|apple|amazon|google|nvidia|microsoft|meta|netflix|"
-    r"gamestop|palantir|amd)\b",
+    r"gamestop|palantir|amd|uber|disney|intel|boeing|jpmorgan|"
+    r"berkshire|spotify|snap|robinhood|rivian|lucid|affirm|sofi|"
+    r"crowdstrike|snowflake|microstrategy|marathon digital|riot platforms)\b",
     re.IGNORECASE,
 )
 
@@ -895,6 +931,899 @@ def analyze_sports(question: str, end_dt: datetime) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Earnings Analyzer — Yahoo Finance earnings surprise detection
+# ---------------------------------------------------------------------------
+# Detects "Will X beat earnings?" markets and compares to analyst consensus.
+# Uses Yahoo Finance public endpoint — no API key needed.
+
+_earnings_cache: dict[str, tuple[float, object]] = {}
+_earnings_lock = threading.Lock()
+EARNINGS_CACHE_TTL = 600  # 10 min
+
+_EARNINGS_KEYWORDS_RE = re.compile(
+    r"\b(?:earnings|revenue|eps|profit|quarterly|beat|miss|"
+    r"q[1-4]\s*(?:20\d{2})?|earnings\s*call|guidance|"
+    r"report\s*(?:revenue|earnings|profit)|fiscal)\b",
+    re.IGNORECASE,
+)
+
+_EARNINGS_BEAT_RE = re.compile(
+    r"\b(?:beat|exceed|surpass|top|above)\b", re.IGNORECASE
+)
+_EARNINGS_MISS_RE = re.compile(
+    r"\b(?:miss|below|under|fall\s+short|disappoint)\b", re.IGNORECASE
+)
+
+
+def _fetch_earnings_data(ticker: str) -> dict | None:
+    """Fetch earnings estimates from Yahoo Finance.
+
+    Returns {ticker, est_eps, actual_eps, surprise_pct, beat_rate} or None.
+    """
+    now_ts = _time.time()
+    cache_key = f"earn_{ticker}"
+    with _earnings_lock:
+        expired = [k for k, (ts, _) in _earnings_cache.items()
+                   if now_ts - ts >= EARNINGS_CACHE_TTL]
+        for k in expired:
+            del _earnings_cache[k]
+        if cache_key in _earnings_cache:
+            ts, data = _earnings_cache[cache_key]
+            if now_ts - ts < EARNINGS_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+            params={"modules": "earningsTrend,earnings"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("quoteSummary", {}).get("result", [])
+        if not result:
+            return None
+
+        modules = result[0]
+
+        # Extract beat rate from historical earnings
+        earnings_data = modules.get("earnings", {})
+        earnings_chart = earnings_data.get("earningsChart", {})
+        quarterly = earnings_chart.get("quarterly", [])
+
+        beats = 0
+        total = 0
+        for q in quarterly:
+            actual_raw = q.get("actual", {})
+            est_raw = q.get("estimate", {})
+            actual_val = actual_raw.get("raw") if isinstance(actual_raw, dict) else None
+            est_val = est_raw.get("raw") if isinstance(est_raw, dict) else None
+            if actual_val is not None and est_val is not None:
+                total += 1
+                if actual_val > est_val:
+                    beats += 1
+        beat_rate = beats / total if total >= 2 else 0.65  # default 65%
+
+        # Extract current estimate from earningsTrend
+        trend = modules.get("earningsTrend", {}).get("trend", [])
+        est_eps = None
+        for t in trend:
+            period = t.get("period", "")
+            if period in ("0q", "+1q"):
+                eps_est = t.get("earningsEstimate", {})
+                avg_raw = eps_est.get("avg", {})
+                if isinstance(avg_raw, dict) and avg_raw.get("raw") is not None:
+                    est_eps = avg_raw["raw"]
+                    break
+
+        data = {
+            "ticker": ticker,
+            "beat_rate": round(beat_rate, 3),
+            "est_eps": est_eps,
+            "num_quarters": total,
+        }
+        with _earnings_lock:
+            _earnings_cache[cache_key] = (_time.time(), data)
+        return data
+    except Exception as exc:
+        _logger.warning("Yahoo earnings error for %s: %s", ticker, exc)
+        return None
+
+
+def analyze_earnings(question: str, end_dt: datetime) -> dict | None:
+    """Analyze earnings market using historical beat rate + analyst consensus.
+
+    Detects "Will X beat earnings?" style questions and returns probability
+    based on historical beat rate (last 4 quarters).
+    No API key required — uses Yahoo Finance.
+    """
+    if not _EARNINGS_KEYWORDS_RE.search(question):
+        return None
+
+    ticker = _find_ticker(question)
+    if not ticker:
+        return None
+
+    data = _fetch_earnings_data(ticker)
+    if not data:
+        return None
+
+    beat_rate = data["beat_rate"]
+    est_eps = data["est_eps"]
+    num_q = data["num_quarters"]
+
+    # Determine direction: beat or miss
+    is_miss = bool(_EARNINGS_MISS_RE.search(question))
+    is_beat = bool(_EARNINGS_BEAT_RE.search(question)) or not is_miss
+
+    if is_miss:
+        prob = 1.0 - beat_rate
+        direction = "miss"
+    else:
+        prob = beat_rate
+        direction = "beat"
+
+    # Confidence based on data quality
+    if num_q >= 4:
+        confidence = "high"
+    elif num_q >= 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    # Adjust confidence by time horizon
+    now_dt = datetime.now(timezone.utc)
+    days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+    if days > 30:
+        confidence = "low"
+    elif days > 14 and confidence == "high":
+        confidence = "medium"
+
+    eps_note = f", EPS est ${est_eps:.2f}" if est_eps is not None else ""
+
+    return {
+        "estimated_prob": round(prob, 3),
+        "source": "Yahoo Finance Earnings",
+        "analysis": (f"{ticker} historical {direction} rate: {beat_rate*100:.0f}% "
+                     f"({num_q}Q data{eps_note}). "
+                     f"P({direction})={prob*100:.0f}%."),
+        "confidence": confidence,
+        "data_point": f"{beat_rate*100:.0f}% {direction} rate ({num_q}Q)",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fed/Macro Analyzer — FRED API economic indicator detection
+# ---------------------------------------------------------------------------
+# Detects markets about Fed rates, CPI/inflation, unemployment, GDP.
+# Uses FRED (Federal Reserve Economic Data) — free API key optional.
+# Falls back to hardcoded recent values if no key.
+
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+FRED_API_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_CACHE_TTL = 1800  # 30 min (macro data moves slowly)
+_fred_cache: dict[str, tuple[float, object]] = {}
+_fred_lock = threading.Lock()
+
+# FRED series IDs for key economic indicators
+FRED_SERIES: dict[str, dict] = {
+    "fed_rate": {
+        "series_id": "DFEDTARU",  # Fed funds upper target
+        "label": "Fed Funds Rate",
+        "unit": "%",
+    },
+    "cpi": {
+        "series_id": "CPIAUCSL",  # CPI All Urban Consumers
+        "label": "CPI",
+        "unit": "index",
+    },
+    "cpi_yoy": {
+        "series_id": "CPALTT01USM657N",  # CPI YoY %
+        "label": "CPI YoY",
+        "unit": "%",
+    },
+    "unemployment": {
+        "series_id": "UNRATE",  # Unemployment Rate
+        "label": "Unemployment Rate",
+        "unit": "%",
+    },
+    "gdp_growth": {
+        "series_id": "A191RL1Q225SBEA",  # Real GDP Growth
+        "label": "GDP Growth",
+        "unit": "%",
+    },
+    "nonfarm_payrolls": {
+        "series_id": "PAYEMS",  # Total Nonfarm Payrolls
+        "label": "Nonfarm Payrolls",
+        "unit": "thousands",
+    },
+    "pce": {
+        "series_id": "PCEPI",  # PCE Price Index
+        "label": "PCE",
+        "unit": "index",
+    },
+}
+
+_FED_RATE_RE = re.compile(
+    r"\b(?:fed(?:eral)?\s*(?:funds?\s*)?rate|interest\s*rate|fomc|"
+    r"rate\s*(?:cut|hike|raise|hold|pause|unchanged|decision)|"
+    r"(?:cut|hike|raise|hold|pause)\s*rates?|"
+    r"basis\s*points?|bps|"
+    r"fed\s*(?:meeting|decision|cut|hike|raise|hold))\b",
+    re.IGNORECASE,
+)
+
+_INFLATION_RE = re.compile(
+    r"\b(?:inflation|cpi|consumer\s*price|pce|"
+    r"core\s*(?:inflation|cpi|pce)|"
+    r"price\s*index)\b",
+    re.IGNORECASE,
+)
+
+_UNEMPLOYMENT_RE = re.compile(
+    r"\b(?:unemployment|jobless|nonfarm|payroll|jobs?\s*report|"
+    r"labor\s*market|employment\s*(?:rate|report|data))\b",
+    re.IGNORECASE,
+)
+
+_GDP_RE = re.compile(
+    r"\b(?:gdp|gross\s*domestic|economic\s*growth|recession|"
+    r"gdp\s*(?:growth|contraction|report))\b",
+    re.IGNORECASE,
+)
+
+_MACRO_THRESHOLD_RE = re.compile(
+    r"(?:above|over|exceed|reach|below|under|at least|higher than|lower than)"
+    r"\s+(\d+(?:\.\d+)?)\s*%?",
+    re.IGNORECASE,
+)
+
+_MACRO_CUT_HIKE_RE = re.compile(
+    r"\b(?:cut|lower|reduce|ease|dovish)\b", re.IGNORECASE
+)
+_MACRO_HIKE_RE = re.compile(
+    r"\b(?:hike|raise|increase|tighten|hawkish)\b", re.IGNORECASE
+)
+_MACRO_HOLD_RE = re.compile(
+    r"\b(?:hold|unchanged|pause|no\s*change|maintain|steady)\b", re.IGNORECASE
+)
+
+
+def _fetch_fred_series(series_id: str) -> float | None:
+    """Fetch latest value from FRED API. Returns float or None."""
+    if not FRED_API_KEY:
+        return None
+    now_ts = _time.time()
+    cache_key = f"fred_{series_id}"
+    with _fred_lock:
+        expired = [k for k, (ts, _) in _fred_cache.items()
+                   if now_ts - ts >= FRED_CACHE_TTL]
+        for k in expired:
+            del _fred_cache[k]
+        if cache_key in _fred_cache:
+            ts, data = _fred_cache[cache_key]
+            if now_ts - ts < FRED_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(FRED_API_URL, params={
+            "series_id": series_id,
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 5,
+        }, timeout=8)
+        resp.raise_for_status()
+        obs = resp.json().get("observations", [])
+        for o in obs:
+            val_str = o.get("value", ".")
+            if val_str != ".":
+                val = float(val_str)
+                with _fred_lock:
+                    _fred_cache[cache_key] = (_time.time(), val)
+                return val
+        return None
+    except Exception as exc:
+        _logger.warning("FRED API error for %s: %s", series_id, exc)
+        return None
+
+
+def analyze_fed_macro(question: str, end_dt: datetime) -> dict | None:
+    """Analyze Fed/macro market using FRED economic data.
+
+    Detects: rate decisions, CPI/inflation, unemployment, GDP markets.
+    Uses FRED API when key available, provides analysis for rate direction markets.
+    """
+    q_lower = question.lower()
+
+    # --- Fed rate decision markets ---
+    if _FED_RATE_RE.search(question):
+        current_rate = _fetch_fred_series("DFEDTARU")
+
+        is_cut = bool(_MACRO_CUT_HIKE_RE.search(question))
+        is_hike = bool(_MACRO_HIKE_RE.search(question))
+        is_hold = bool(_MACRO_HOLD_RE.search(question))
+
+        # Extract threshold if present (e.g., "rate above 4.5%")
+        m_thresh = _MACRO_THRESHOLD_RE.search(question)
+        threshold = float(m_thresh.group(1)) if m_thresh else None
+
+        if current_rate is not None:
+            rate_str = f"{current_rate:.2f}%"
+
+            if threshold is not None:
+                # Threshold-based: "Will rate be above/below X%?"
+                is_below = any(w in q_lower for w in
+                               ["below", "under", "lower", "less", "fall"])
+                if is_below:
+                    prob = 0.7 if current_rate > threshold else 0.3
+                else:
+                    prob = 0.7 if current_rate >= threshold else 0.3
+
+                direction = "below" if is_below else "above"
+                analysis = (f"Fed rate @ {rate_str}, target {direction} "
+                            f"{threshold}%. Market pricing.")
+            elif is_hold:
+                # "Will Fed hold?" — most meetings result in hold
+                prob = 0.75  # historically ~75% of meetings are holds
+                analysis = f"Fed rate @ {rate_str}. Hold is base case."
+            elif is_cut:
+                prob = 0.30  # cuts are rarer events
+                analysis = f"Fed rate @ {rate_str}. Cuts require economic weakness."
+            elif is_hike:
+                prob = 0.10  # hikes even rarer in current cycle
+                analysis = f"Fed rate @ {rate_str}. Hikes unlikely in current cycle."
+            else:
+                prob = 0.50
+                analysis = f"Fed rate @ {rate_str}. Ambiguous direction."
+        else:
+            # No FRED key — provide generic analysis
+            if is_hold:
+                prob = 0.75
+            elif is_cut:
+                prob = 0.30
+            elif is_hike:
+                prob = 0.10
+            else:
+                prob = 0.50
+            rate_str = "N/A"
+            analysis = "Fed rate direction analysis (no FRED key for live data)."
+
+        now_dt = datetime.now(timezone.utc)
+        days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+        confidence = "high" if days <= 7 else ("medium" if days <= 30 else "low")
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "FRED / Fed Analysis",
+            "analysis": analysis,
+            "confidence": confidence,
+            "data_point": f"Rate: {rate_str}",
+        }
+
+    # --- CPI / Inflation markets ---
+    if _INFLATION_RE.search(question):
+        cpi_yoy = _fetch_fred_series("CPALTT01USM657N")
+        m_thresh = _MACRO_THRESHOLD_RE.search(question)
+        threshold = float(m_thresh.group(1)) if m_thresh else None
+
+        if cpi_yoy is not None and threshold is not None:
+            is_below = any(w in q_lower for w in
+                           ["below", "under", "lower", "less", "fall"])
+            margin = abs(cpi_yoy - threshold)
+            if is_below:
+                prob = 1.0 / (1.0 + math.exp(-(threshold - cpi_yoy) / 0.5))
+            else:
+                prob = 1.0 / (1.0 + math.exp(-(cpi_yoy - threshold) / 0.5))
+            direction = "below" if is_below else "above"
+            analysis = (f"CPI YoY @ {cpi_yoy:.1f}%, target {direction} "
+                        f"{threshold}% ({margin:.1f}pp away). "
+                        f"Sigmoid P={prob*100:.0f}%.")
+            data_point = f"CPI YoY: {cpi_yoy:.1f}%"
+        elif cpi_yoy is not None:
+            prob = 0.50
+            analysis = f"CPI YoY @ {cpi_yoy:.1f}%. No threshold detected."
+            data_point = f"CPI YoY: {cpi_yoy:.1f}%"
+        else:
+            return None  # No data, can't analyze
+
+        now_dt = datetime.now(timezone.utc)
+        days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+        confidence = "high" if days <= 7 else ("medium" if days <= 30 else "low")
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "FRED",
+            "analysis": analysis,
+            "confidence": confidence,
+            "data_point": data_point,
+        }
+
+    # --- Unemployment markets ---
+    if _UNEMPLOYMENT_RE.search(question):
+        unemp = _fetch_fred_series("UNRATE")
+        m_thresh = _MACRO_THRESHOLD_RE.search(question)
+        threshold = float(m_thresh.group(1)) if m_thresh else None
+
+        if unemp is not None and threshold is not None:
+            is_below = any(w in q_lower for w in
+                           ["below", "under", "lower", "less", "fall"])
+            if is_below:
+                prob = 1.0 / (1.0 + math.exp(-(threshold - unemp) / 0.3))
+            else:
+                prob = 1.0 / (1.0 + math.exp(-(unemp - threshold) / 0.3))
+            direction = "below" if is_below else "above"
+            analysis = (f"Unemployment @ {unemp:.1f}%, target {direction} "
+                        f"{threshold}%. Sigmoid P={prob*100:.0f}%.")
+            data_point = f"Unemployment: {unemp:.1f}%"
+        elif unemp is not None:
+            prob = 0.50
+            analysis = f"Unemployment @ {unemp:.1f}%. No threshold detected."
+            data_point = f"Unemployment: {unemp:.1f}%"
+        else:
+            return None
+
+        now_dt = datetime.now(timezone.utc)
+        days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+        confidence = "high" if days <= 7 else ("medium" if days <= 30 else "low")
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "FRED",
+            "analysis": analysis,
+            "confidence": confidence,
+            "data_point": data_point,
+        }
+
+    # --- GDP / Recession markets ---
+    if _GDP_RE.search(question):
+        gdp = _fetch_fred_series("A191RL1Q225SBEA")
+
+        # Recession = 2 consecutive quarters of negative GDP
+        is_recession_q = "recession" in q_lower
+
+        if gdp is not None:
+            if is_recession_q:
+                # Recession probability based on current GDP growth
+                if gdp < 0:
+                    prob = 0.55  # already contracting
+                elif gdp < 1.0:
+                    prob = 0.30  # slow growth
+                else:
+                    prob = 0.15  # healthy growth
+                analysis = (f"GDP growth @ {gdp:.1f}%. "
+                            f"Recession P={prob*100:.0f}%.")
+            else:
+                m_thresh = _MACRO_THRESHOLD_RE.search(question)
+                threshold = float(m_thresh.group(1)) if m_thresh else None
+                if threshold is not None:
+                    is_below = any(w in q_lower for w in
+                                   ["below", "under", "lower", "less"])
+                    if is_below:
+                        prob = 1.0 / (1.0 + math.exp(-(threshold - gdp) / 0.5))
+                    else:
+                        prob = 1.0 / (1.0 + math.exp(-(gdp - threshold) / 0.5))
+                    direction = "below" if is_below else "above"
+                    analysis = (f"GDP @ {gdp:.1f}%, target {direction} "
+                                f"{threshold}%. P={prob*100:.0f}%.")
+                else:
+                    prob = 0.50
+                    analysis = f"GDP growth @ {gdp:.1f}%. No threshold detected."
+            data_point = f"GDP: {gdp:.1f}%"
+        else:
+            if is_recession_q:
+                prob = 0.20  # base rate
+                analysis = "GDP data unavailable. Using base recession rate."
+                data_point = "GDP: N/A"
+            else:
+                return None
+
+        now_dt = datetime.now(timezone.utc)
+        days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+        confidence = "medium" if days <= 30 else "low"
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "FRED",
+            "analysis": analysis,
+            "confidence": confidence,
+            "data_point": data_point,
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Crypto Price Analyzer — CoinGecko API
+# ---------------------------------------------------------------------------
+# Detects crypto price target markets and compares to current market price.
+# Uses CoinGecko free API — no key needed.
+# Only activates for markets that pass crypto detection but have price targets.
+
+COINGECKO_API = "https://api.coingecko.com/api/v3"
+CRYPTO_CACHE_TTL = 300  # 5 min
+_crypto_cache: dict[str, tuple[float, object]] = {}
+_crypto_lock = threading.Lock()
+
+CRYPTO_TICKERS: dict[str, str] = {
+    "bitcoin": "bitcoin", "btc": "bitcoin",
+    "ethereum": "ethereum", "eth": "ethereum",
+    "solana": "solana", "sol": "solana",
+    "cardano": "cardano", "ada": "cardano",
+    "ripple": "ripple", "xrp": "ripple",
+    "dogecoin": "dogecoin", "doge": "dogecoin",
+    "polkadot": "polkadot", "dot": "polkadot",
+    "avalanche": "avalanche-2", "avax": "avalanche-2",
+    "chainlink": "chainlink", "link": "chainlink",
+    "litecoin": "litecoin", "ltc": "litecoin",
+    "polygon": "matic-network", "matic": "matic-network",
+    "shiba inu": "shiba-inu", "shib": "shiba-inu",
+    "tron": "tron", "trx": "tron",
+    "uniswap": "uniswap", "uni": "uniswap",
+    "near protocol": "near", "near": "near",
+    "sui": "sui",
+    "aptos": "aptos", "apt": "aptos",
+    "arbitrum": "arbitrum", "arb": "arbitrum",
+    "optimism": "optimism", "op": "optimism",
+    "pepe": "pepe",
+}
+
+_CRYPTO_PRICE_RE = re.compile(
+    r"\b(?:price|reach|hit|close|above|below|exceed|surpass|"
+    r"worth|trade|trading)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_crypto_ticker(question: str) -> str | None:
+    """Find CoinGecko coin ID from question. Longest match wins."""
+    q_lower = question.lower()
+    best = None
+    best_len = 0
+    for name, coin_id in CRYPTO_TICKERS.items():
+        if name in q_lower and len(name) > best_len:
+            best = coin_id
+            best_len = len(name)
+    return best
+
+
+def _fetch_crypto_price(coin_id: str) -> dict | None:
+    """Fetch current price + 30d change from CoinGecko. Cache 5 min."""
+    now_ts = _time.time()
+    cache_key = f"crypto_{coin_id}"
+    with _crypto_lock:
+        expired = [k for k, (ts, _) in _crypto_cache.items()
+                   if now_ts - ts >= CRYPTO_CACHE_TTL]
+        for k in expired:
+            del _crypto_cache[k]
+        if cache_key in _crypto_cache:
+            ts, data = _crypto_cache[cache_key]
+            if now_ts - ts < CRYPTO_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(
+            f"{COINGECKO_API}/coins/{coin_id}",
+            params={
+                "localization": "false",
+                "tickers": "false",
+                "community_data": "false",
+                "developer_data": "false",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        market_data = data.get("market_data", {})
+        current = market_data.get("current_price", {}).get("usd")
+        ath = market_data.get("ath", {}).get("usd")
+        change_30d = market_data.get("price_change_percentage_30d", 0)
+        vol_30d = abs(change_30d) / 100 if change_30d else 0.30  # rough monthly vol
+
+        if not current or current <= 0:
+            return None
+
+        result = {
+            "price": current,
+            "ath": ath,
+            "change_30d": change_30d,
+            "monthly_vol": vol_30d,
+            "coin_id": coin_id,
+        }
+        with _crypto_lock:
+            _crypto_cache[cache_key] = (_time.time(), result)
+        return result
+    except Exception as exc:
+        _logger.warning("CoinGecko error for %s: %s", coin_id, exc)
+        return None
+
+
+def analyze_crypto(question: str, end_dt: datetime) -> dict | None:
+    """Analyze crypto price market using CoinGecko data + log-normal model.
+
+    Similar to finance analyzer but for crypto assets.
+    Uses higher volatility assumptions (crypto-appropriate).
+    No API key required.
+    """
+    if not _CRYPTO_PRICE_RE.search(question):
+        return None
+
+    coin_id = _find_crypto_ticker(question)
+    if not coin_id:
+        return None
+
+    # Extract price threshold
+    m = _PRICE_THRESHOLD_RE.search(question)
+    if not m:
+        return None
+    raw_val = m.group(1) or m.group(2)
+    threshold = float(raw_val.replace(",", ""))
+    if threshold <= 0:
+        return None
+
+    data = _fetch_crypto_price(coin_id)
+    if not data:
+        return None
+
+    current = data["price"]
+    monthly_vol = data["monthly_vol"]
+    # Convert monthly vol to daily (assuming ~30 trading days)
+    daily_vol = monthly_vol / math.sqrt(30) if monthly_vol > 0 else 0.05
+
+    now_dt = datetime.now(timezone.utc)
+    days = max((end_dt - now_dt).total_seconds() / 86400, 0.1)
+
+    # Log-normal model (same as finance but with higher vol)
+    sigma_period = daily_vol * math.sqrt(days)
+    # No drift for crypto (no risk-free rate equivalent)
+    if sigma_period < 0.001:
+        prob_above = 1.0 if current >= threshold else 0.0
+    else:
+        z = math.log(threshold / current) / sigma_period
+        prob_above = 1.0 - _normal_cdf(z)
+
+    q_lower = question.lower()
+    is_below = any(w in q_lower for w in
+                   ["below", "under", "fall", "drop", "decline", "crash",
+                    "sink", "less than", "lower than"])
+    prob = (1.0 - prob_above) if is_below else prob_above
+
+    if days <= 7:
+        confidence = "medium"  # crypto always lower confidence
+    elif days <= 30:
+        confidence = "low"
+    else:
+        confidence = "low"
+
+    pct_away = abs(threshold - current) / current * 100
+    direction = "below" if is_below else "above"
+    coin_name = coin_id.replace("-", " ").title()
+
+    return {
+        "estimated_prob": round(prob, 3),
+        "source": "CoinGecko",
+        "analysis": (f"{coin_name} @ ${current:,.2f}, target {direction} "
+                     f"${threshold:,.2f} ({pct_away:.1f}% away, {days:.0f}d, "
+                     f"vol ~{daily_vol*100:.1f}%/d). P={prob*100:.0f}%."),
+        "confidence": confidence,
+        "data_point": f"${current:,.2f} ({coin_name})",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Elections/Polls Analyzer — polling aggregator edge detection
+# ---------------------------------------------------------------------------
+# Detects election/political markets and compares to RealClearPolitics/538 data.
+# Uses RCP RSS feed for polling averages — no API key needed.
+
+POLLS_CACHE_TTL = 1800  # 30 min (polls update slowly)
+_polls_cache: dict[str, tuple[float, object]] = {}
+_polls_lock = threading.Lock()
+
+_ELECTION_RE = re.compile(
+    r"\b(?:elections?|elected|nominees?|primari(?:y|es)|caucus|ballot|"
+    r"presidential|gubernatorial|midterms?|runoff|"
+    r"democrats?(?:ic)?|republicans?|gop|"
+    r"senate|house\s*(?:of\s*representatives?|race|seat|control)|"
+    r"congress(?:ional)?|governor(?:'?s)?)\b",
+    re.IGNORECASE,
+)
+
+_APPROVAL_RE = re.compile(
+    r"\b(?:approval|favorab(?:le|ility)|job\s*approval|"
+    r"approval\s*rating|disapproval)\b",
+    re.IGNORECASE,
+)
+
+# Mapping of common political figures / races for RCP scraping
+_POLITICAL_FIGURES: dict[str, dict] = {
+    "trump": {"name": "Donald Trump", "party": "R"},
+    "biden": {"name": "Joe Biden", "party": "D"},
+    "harris": {"name": "Kamala Harris", "party": "D"},
+    "desantis": {"name": "Ron DeSantis", "party": "R"},
+    "newsom": {"name": "Gavin Newsom", "party": "D"},
+    "haley": {"name": "Nikki Haley", "party": "R"},
+    "vance": {"name": "JD Vance", "party": "R"},
+    "buttigieg": {"name": "Pete Buttigieg", "party": "D"},
+    "shapiro": {"name": "Josh Shapiro", "party": "D"},
+    "whitmer": {"name": "Gretchen Whitmer", "party": "D"},
+}
+
+# Baseline probabilities for common election patterns
+_INCUMBENT_ADVANTAGE = 0.55  # incumbents win ~55% of the time
+_PARTY_CONTROL: dict[str, float] = {
+    "senate_dem": 0.45,  # baseline Dem Senate control
+    "senate_rep": 0.55,
+    "house_dem": 0.50,
+    "house_rep": 0.50,
+}
+
+
+def _find_political_figure(question: str) -> dict | None:
+    """Find political figure in question. Returns info dict or None."""
+    q_lower = question.lower()
+    for key, info in _POLITICAL_FIGURES.items():
+        if key in q_lower:
+            return info
+    return None
+
+
+def _fetch_approval_data(figure_name: str) -> dict | None:
+    """Fetch approval rating from RCP-style polling aggregator.
+
+    Uses a public JSON endpoint. Cache 30 min.
+    """
+    now_ts = _time.time()
+    cache_key = f"approval_{figure_name}"
+    with _polls_lock:
+        expired = [k for k, (ts, _) in _polls_cache.items()
+                   if now_ts - ts >= POLLS_CACHE_TTL]
+        for k in expired:
+            del _polls_cache[k]
+        if cache_key in _polls_cache:
+            ts, data = _polls_cache[cache_key]
+            if now_ts - ts < POLLS_CACHE_TTL:
+                return data
+
+    # Try RealClearPolitics JSON endpoint
+    try:
+        # RCP public polling average page
+        slug = figure_name.lower().replace(" ", "_")
+        resp = requests.get(
+            f"https://www.realclearpolling.com/api/polls/approval/{slug}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Extract latest average
+            if isinstance(data, dict):
+                approve = data.get("approve") or data.get("average")
+                disapprove = data.get("disapprove")
+                if approve:
+                    result = {
+                        "approve": float(approve),
+                        "disapprove": float(disapprove) if disapprove else None,
+                        "source": "RealClearPolitics",
+                    }
+                    with _polls_lock:
+                        _polls_cache[cache_key] = (_time.time(), result)
+                    return result
+    except Exception as exc:
+        _logger.warning("RCP approval fetch error for %s: %s", figure_name, exc)
+
+    return None
+
+
+def analyze_elections(question: str, end_dt: datetime) -> dict | None:
+    """Analyze election/political market using polling data + base rates.
+
+    Detects: election outcomes, approval ratings, party control markets.
+    Uses RealClearPolitics when available, falls back to base rates.
+    No API key required.
+    """
+    q_lower = question.lower()
+
+    # --- Approval rating markets ---
+    if _APPROVAL_RE.search(question):
+        figure = _find_political_figure(question)
+        if not figure:
+            return None
+
+        approval_data = _fetch_approval_data(figure["name"])
+        m_thresh = _MACRO_THRESHOLD_RE.search(question)
+        threshold = float(m_thresh.group(1)) if m_thresh else None
+
+        if approval_data and threshold:
+            approve = approval_data["approve"]
+            is_below = any(w in q_lower for w in
+                           ["below", "under", "lower", "less", "fall"])
+            margin = approve - threshold
+            if is_below:
+                prob = 1.0 / (1.0 + math.exp(-(threshold - approve) / 2.0))
+            else:
+                prob = 1.0 / (1.0 + math.exp(-(approve - threshold) / 2.0))
+            direction = "below" if is_below else "above"
+            analysis = (f"{figure['name']} approval @ {approve:.1f}%, "
+                        f"target {direction} {threshold}%. "
+                        f"P={prob*100:.0f}%.")
+            data_point = f"Approval: {approve:.1f}%"
+            confidence = "medium"
+        elif approval_data:
+            approve = approval_data["approve"]
+            prob = 0.50
+            analysis = f"{figure['name']} approval @ {approve:.1f}%."
+            data_point = f"Approval: {approve:.1f}%"
+            confidence = "low"
+        else:
+            return None
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "RealClearPolitics",
+            "analysis": analysis,
+            "confidence": confidence,
+            "data_point": data_point,
+        }
+
+    # --- Election outcome markets ---
+    if _ELECTION_RE.search(question):
+        figure = _find_political_figure(question)
+
+        # Party control markets
+        is_senate = "senate" in q_lower
+        is_house = "house" in q_lower
+        is_dem = any(w in q_lower for w in ["democrat", "dem ", "democratic"])
+        is_rep = any(w in q_lower for w in ["republican", "gop", "rep "])
+
+        if (is_senate or is_house) and (is_dem or is_rep):
+            chamber = "senate" if is_senate else "house"
+            party = "dem" if is_dem else "rep"
+            key = f"{chamber}_{party}"
+            prob = _PARTY_CONTROL.get(key, 0.50)
+            analysis = (f"{chamber.title()} {party.upper()} control: "
+                        f"base rate {prob*100:.0f}%.")
+            data_point = f"{chamber.title()} control base rate"
+
+            now_dt = datetime.now(timezone.utc)
+            days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+            confidence = "low"  # pure base rate without polling data
+
+            return {
+                "estimated_prob": round(prob, 3),
+                "source": "Polling Analysis",
+                "analysis": analysis,
+                "confidence": confidence,
+                "data_point": data_point,
+            }
+
+        # Specific candidate markets — use generic base rates
+        if figure:
+            is_incumbent = any(w in q_lower for w in
+                               ["re-elect", "reelect", "re-election"])
+            prob = _INCUMBENT_ADVANTAGE if is_incumbent else 0.50
+            analysis = (f"{figure['name']} ({figure['party']}): "
+                        f"base rate analysis. Incumbent advantage "
+                        f"{'applies' if is_incumbent else 'N/A'}.")
+            data_point = f"{figure['name']} ({figure['party']})"
+
+            now_dt = datetime.now(timezone.utc)
+            days = max((end_dt - now_dt).total_seconds() / 86400, 0)
+            confidence = "low"
+
+            return {
+                "estimated_prob": round(prob, 3),
+                "source": "Polling Analysis",
+                "analysis": analysis,
+                "confidence": confidence,
+                "data_point": data_point,
+            }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Analyzer orchestrator
 # ---------------------------------------------------------------------------
 
@@ -902,7 +1831,8 @@ def run_analyzers(question: str, end_dt: datetime) -> dict | None:
     """Run all available analyzers on a market question.
 
     Returns first positive analysis result or None.
-    Order: weather → finance → sports (deterministic).
+    Order: weather → finance → earnings → sports → fed/macro → elections → crypto
+    (deterministic, first match wins).
     """
     # Weather (OpenWeatherMap)
     result = analyze_weather(question, end_dt)
@@ -914,8 +1844,28 @@ def run_analyzers(question: str, end_dt: datetime) -> dict | None:
     if result:
         return result
 
+    # Earnings (Yahoo Finance — no API key needed)
+    result = analyze_earnings(question, end_dt)
+    if result:
+        return result
+
     # Sports (The Odds API — optional key)
     result = analyze_sports(question, end_dt)
+    if result:
+        return result
+
+    # Fed/Macro (FRED API — optional key, some analysis without key)
+    result = analyze_fed_macro(question, end_dt)
+    if result:
+        return result
+
+    # Elections/Polls (RealClearPolitics — no key needed)
+    result = analyze_elections(question, end_dt)
+    if result:
+        return result
+
+    # Crypto (CoinGecko — no key needed, only for crypto price markets)
+    result = analyze_crypto(question, end_dt)
     if result:
         return result
 
@@ -1019,27 +1969,50 @@ def extract_category(m: dict) -> str:
         ("Politics", ["trump", "biden", "election", "congress", "senate",
                        "governor", "president", "democrat", "republican",
                        "vote", "poll", "white house", "legislation", "impeach",
-                       "supreme court", "scotus", "parliament", "prime minister"]),
+                       "supreme court", "scotus", "parliament", "prime minister",
+                       "midterm", "primary", "caucus", "nominee"]),
         ("Sports", ["nfl", "nba", "mlb", "nhl", "soccer", "football",
                      "basketball", "baseball", "tennis", "ufc", "boxing",
                      "super bowl", "world cup", "championship", "playoffs",
-                     "grand slam", "formula 1", "f1 ", "olympics"]),
-        ("Economics", ["fed ", "interest rate", "gdp", "inflation", "stock",
-                       "s&p", "nasdaq", "dow jones", "recession", "cpi",
+                     "grand slam", "formula 1", "f1 ", "olympics",
+                     "cricket", "rugby", "esports", "golf", "mma"]),
+        ("Finance", ["stock", "share", "earnings", "revenue", "eps",
+                      "s&p", "nasdaq", "dow jones", "ipo",
+                      "acquisition", "merger", "dividend",
+                      "close above", "close below", "trading above",
+                      "market cap"]),
+        ("Economics", ["fed ", "interest rate", "gdp", "inflation",
+                       "recession", "cpi", "pce",
                        "jobs report", "unemployment", "treasury", "tariff",
-                       "oil price", "gold price"]),
+                       "nonfarm", "payroll", "fomc", "rate cut", "rate hike",
+                       "government shutdown"]),
+        ("Crypto", ["bitcoin", "btc", "ethereum", "solana",
+                     "crypto", "dogecoin", "ripple", "xrp",
+                     "cardano", "blockchain", "defi", "nft",
+                     "token price", "coin price", "altcoin"]),
+        ("Commodities", ["gold price", "oil price", "silver price",
+                          "crude oil", "natural gas", "copper price",
+                          "platinum", "commodity"]),
+        ("Forex", ["euro ", "eur/usd", "gbp", "yen", "yuan",
+                    "dollar index", "dxy", "forex", "currency",
+                    "exchange rate"]),
         ("Tech", [" ai ", "openai", "google", "apple", "microsoft", "tesla",
-                  "spacex", "chatgpt", "artificial intelligence", "llm "]),
+                  "spacex", "chatgpt", "artificial intelligence", "llm ",
+                  "semiconductor", "chip", "data center"]),
         ("Entertainment", ["oscar", "grammy", "emmy", "movie", "album",
                           "celebrity", "tiktok", "youtube", "netflix",
-                          "disney", "box office", "billboard"]),
+                          "disney", "box office", "billboard",
+                          "golden globe", "rotten tomatoes", "tweet"]),
         ("Geopolitics", ["war ", "ukraine", "russia", "china", "nato",
                         "sanction", "missile", "military", "iran", "israel",
-                        "ceasefire", "invasion", "north korea"]),
+                        "ceasefire", "invasion", "north korea",
+                        "taiwan", "venezuela", "cuba"]),
         ("Weather", ["weather", "hurricane", "earthquake", "temperature",
-                     "climate", "wildfire", "flood", "tornado"]),
+                     "climate", "wildfire", "flood", "tornado",
+                     "snow", "precipitation"]),
         ("Science", ["fda", "vaccine", "covid", "trial", "study",
-                     "nasa", "mars ", "space station"]),
+                     "nasa", "mars ", "space station", "pandemic",
+                     "virus", "clinical trial"]),
     ]
     for cat, keywords in rules:
         if any(kw in q for kw in keywords):
@@ -1139,9 +2112,13 @@ def process_market(m: dict, now: datetime) -> dict | None:
     if volume < MIN_VOLUME or liquidity < MIN_LIQUIDITY:
         return None
 
-    # --- Crypto gate ---
+    # --- Crypto gate (allows crypto price markets through for analyzer) ---
     if is_crypto(question):
-        return None
+        # Let crypto price markets through if they have a price target
+        has_price_target = bool(_PRICE_THRESHOLD_RE.search(question))
+        has_crypto_ticker = _find_crypto_ticker(question) is not None
+        if not (has_price_target and has_crypto_ticker):
+            return None
 
     # --- Volume 24h gate (skip dead markets when data available) ---
     has_24h = (m.get("volume24hr") is not None or
@@ -2037,7 +3014,9 @@ def _validate_api_keys():
     else:
         print("  [--] No OpenWeatherMap key (OPENWEATHERMAP_API_KEY)")
     # --- Yahoo Finance ---
-    print("  [OK] Yahoo Finance — no key needed, always active")
+    print("  [OK] Yahoo Finance — no key needed (finance + earnings)")
+    # --- CoinGecko ---
+    print("  [OK] CoinGecko — no key needed (crypto prices)")
     # --- The Odds API ---
     if ODDS_API_KEY:
         print(f"  [OK] The Odds API key ({ODDS_API_KEY[:4]}...)")
@@ -2057,11 +3036,34 @@ def _validate_api_keys():
             print(f"       [WARN] API unreachable: {exc}")
     else:
         print("  [--] No Odds API key (THE_ODDS_API_KEY for sports edge)")
+    # --- FRED ---
+    if FRED_API_KEY:
+        print(f"  [OK] FRED API key ({FRED_API_KEY[:4]}...)")
+        try:
+            resp = requests.get(FRED_API_URL, params={
+                "series_id": "DFEDTARU",
+                "api_key": FRED_API_KEY,
+                "file_type": "json",
+                "limit": 1,
+                "sort_order": "desc",
+            }, timeout=5)
+            if resp.status_code == 200:
+                print("       Validated — macro edge active")
+            elif resp.status_code in (400, 401):
+                print("       [WARN] Key INVALID")
+            else:
+                print(f"       [WARN] API returned {resp.status_code}")
+        except Exception as exc:
+            print(f"       [WARN] API unreachable: {exc}")
+    else:
+        print("  [--] No FRED key (FRED_API_KEY for macro edge)")
+    # --- RealClearPolitics ---
+    print("  [OK] Elections/Polls — no key needed (RCP + base rates)")
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Polymarket Live Opportunity Scanner v4")
+    print("  Polymarket Live Opportunity Scanner v5")
     print("  http://localhost:5000")
     print("=" * 60)
     _validate_api_keys()
