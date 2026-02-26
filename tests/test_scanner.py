@@ -3335,3 +3335,413 @@ class TestYahooFallback:
     @pytest.fixture
     def now(self):
         return datetime.now(timezone.utc)
+
+
+# =========================================================================
+# Anomaly Detection — Trading Anomaly Scanner
+# =========================================================================
+
+from polymarket_scanner import (
+    ANOMALY_VOL_SPIKE_THRESHOLD,
+    ANOMALY_PRICE_JUMP_PCT,
+    ANOMALY_PRICE_VELOCITY_PCT,
+    ANOMALY_VL_RATIO_THRESHOLD,
+    ANOMALY_MIN_VOLUME,
+    ANOMALY_MIN_LIQUIDITY,
+    _detect_volume_spike,
+    _detect_price_jumps,
+    _detect_price_velocity,
+    _detect_volume_liquidity_imbalance,
+    _fetch_price_history,
+    detect_anomalies,
+)
+
+
+class TestVolumeSpike:
+    """Test volume spike detection."""
+
+    def test_spike_detected_when_above_threshold(self):
+        """24h vol = 10x daily avg -> spike detected."""
+        # Market active 30 days (default), total vol = 30000 -> daily avg = 1000
+        # 24h vol = 6000 -> ratio = 6x (above 5x threshold)
+        result = _detect_volume_spike(30000, 6000, None, None)
+        assert result is not None
+        assert result["type"] == "volume_spike"
+        assert result["ratio"] >= ANOMALY_VOL_SPIKE_THRESHOLD
+
+    def test_no_spike_below_threshold(self):
+        """24h vol = 2x daily avg -> no spike."""
+        # Market active 30 days (default), total vol = 30000 -> daily avg = 1000
+        # 24h vol = 2000 -> ratio = 2x (below 5x threshold)
+        result = _detect_volume_spike(30000, 2000, None, None)
+        assert result is None
+
+    def test_spike_with_start_date(self):
+        """Uses startDate to calculate accurate daily average."""
+        start = (datetime.now(timezone.utc) - timedelta(days=10)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        # 10 days old, total vol = 10000 -> daily avg = 1000
+        # 24h vol = 8000 -> ratio = 8x (well above 5x)
+        result = _detect_volume_spike(10000, 8000, start, None)
+        assert result is not None
+        assert result["ratio"] >= 7.0
+
+    def test_zero_volume_24h_returns_none(self):
+        """Zero 24h volume -> no spike."""
+        assert _detect_volume_spike(100000, 0, None, None) is None
+
+    def test_zero_total_volume_returns_none(self):
+        """Zero total volume -> no spike."""
+        assert _detect_volume_spike(0, 5000, None, None) is None
+
+    def test_severity_scales_with_ratio(self):
+        """Higher ratio -> higher severity."""
+        r1 = _detect_volume_spike(30000, 6000, None, None)  # ~6x
+        r2 = _detect_volume_spike(30000, 15000, None, None)  # ~15x
+        assert r2["severity"] > r1["severity"]
+
+
+class TestPriceJumps:
+    """Test sudden price jump detection."""
+
+    def test_jump_detected(self):
+        """Large price jump between consecutive points -> detected."""
+        history = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.50},
+            {"t": 3000, "p": 0.70},  # 40% jump
+            {"t": 4000, "p": 0.72},
+        ]
+        result = _detect_price_jumps(history)
+        assert result is not None
+        assert result["type"] == "price_jump"
+        assert result["jump_pct"] >= ANOMALY_PRICE_JUMP_PCT
+
+    def test_no_jump_small_changes(self):
+        """Small gradual changes -> no jump."""
+        history = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.51},
+            {"t": 3000, "p": 0.52},
+            {"t": 4000, "p": 0.53},
+        ]
+        result = _detect_price_jumps(history)
+        assert result is None
+
+    def test_single_point_returns_none(self):
+        """Only one data point -> no jump possible."""
+        assert _detect_price_jumps([{"t": 1000, "p": 0.50}]) is None
+
+    def test_empty_history_returns_none(self):
+        """Empty history -> no jump."""
+        assert _detect_price_jumps([]) is None
+
+    def test_finds_largest_jump(self):
+        """Multiple jumps -> returns the largest one."""
+        history = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.58},  # 16% jump
+            {"t": 3000, "p": 0.56},
+            {"t": 4000, "p": 0.80},  # 42.8% jump (largest)
+            {"t": 5000, "p": 0.82},
+        ]
+        result = _detect_price_jumps(history)
+        assert result is not None
+        assert result["price_to"] == pytest.approx(0.80, abs=0.01)
+
+    def test_downward_jump_detected(self):
+        """Price crash also detected."""
+        history = [
+            {"t": 1000, "p": 0.80},
+            {"t": 2000, "p": 0.80},
+            {"t": 3000, "p": 0.55},  # ~31% drop
+        ]
+        result = _detect_price_jumps(history)
+        assert result is not None
+        assert result["jump_pct"] > 20
+
+
+class TestPriceVelocity:
+    """Test price acceleration detection."""
+
+    def test_velocity_detected_upward(self):
+        """Rapid price increase over 6h window -> detected."""
+        history = [
+            {"t": i * 3600, "p": 0.40 + i * 0.04}
+            for i in range(8)  # 0.40 -> 0.68 over 8 points
+        ]
+        result = _detect_price_velocity(history)
+        assert result is not None
+        assert result["type"] == "price_velocity"
+
+    def test_velocity_detected_downward(self):
+        """Rapid price decrease -> also detected."""
+        history = [
+            {"t": i * 3600, "p": 0.80 - i * 0.05}
+            for i in range(8)  # 0.80 -> 0.45 over 8 points
+        ]
+        result = _detect_price_velocity(history)
+        assert result is not None
+
+    def test_no_velocity_stable(self):
+        """Stable prices -> no velocity alert."""
+        history = [
+            {"t": i * 3600, "p": 0.50 + (i % 2) * 0.01}
+            for i in range(8)
+        ]
+        result = _detect_price_velocity(history)
+        assert result is None
+
+    def test_short_history_handled(self):
+        """Less than 6 points -> uses whatever is available."""
+        history = [
+            {"t": 1000, "p": 0.40},
+            {"t": 2000, "p": 0.40},
+            {"t": 3000, "p": 0.70},  # 75% increase
+        ]
+        result = _detect_price_velocity(history)
+        assert result is not None
+
+    def test_two_points_too_few(self):
+        """Only 2 points -> too few for velocity."""
+        result = _detect_price_velocity([
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.90},
+        ])
+        assert result is None  # needs >= 3
+
+
+class TestVLImbalance:
+    """Test volume/liquidity imbalance detection."""
+
+    def test_high_vl_detected(self):
+        """Very high V/L ratio -> imbalance detected."""
+        result = _detect_volume_liquidity_imbalance(150000, 3000)
+        assert result is not None
+        assert result["type"] == "vl_imbalance"
+        assert result["vl_ratio"] >= ANOMALY_VL_RATIO_THRESHOLD
+
+    def test_normal_vl_no_alert(self):
+        """Normal V/L ratio -> no alert."""
+        result = _detect_volume_liquidity_imbalance(10000, 50000)
+        assert result is None
+
+    def test_zero_liquidity_returns_none(self):
+        """Zero liquidity -> no alert (div by zero guard)."""
+        assert _detect_volume_liquidity_imbalance(10000, 0) is None
+
+    def test_zero_volume_returns_none(self):
+        """Zero volume -> no alert."""
+        assert _detect_volume_liquidity_imbalance(0, 5000) is None
+
+
+class TestDetectAnomalies:
+    """Test the main detect_anomalies() function."""
+
+    @pytest.fixture
+    def now(self):
+        return datetime.now(timezone.utc)
+
+    def _make_anomaly_market(self, now, **overrides):
+        """Factory for a market dict suitable for anomaly detection."""
+        start = (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        base = {
+            "question": "Will X happen by March?",
+            "slug": "will-x-happen",
+            "conditionId": "cond_anomaly_123",
+            "endDate": (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "startDate": start,
+            "volume": "50000",
+            "volume24hr": "30000",  # 6x daily avg
+            "liquidity": "10000",
+            "outcomePrices": '["0.60", "0.40"]',
+            "outcomes": '["Yes", "No"]',
+            "clobTokenIds": '["token_abc", "token_def"]',
+        }
+        base.update(overrides)
+        return base
+
+    def test_volume_spike_detected(self, now):
+        """Market with abnormal 24h volume -> anomaly detected."""
+        m = self._make_anomaly_market(now, volume="50000", volume24hr="30000")
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert any(a["type"] == "volume_spike" for a in result["anomalies"])
+
+    def test_vl_imbalance_detected(self, now):
+        """Market with high V/L ratio -> detected."""
+        m = self._make_anomaly_market(
+            now, volume24hr="100000", liquidity="3000"
+        )
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert any(a["type"] == "vl_imbalance" for a in result["anomalies"])
+
+    @patch("polymarket_scanner._fetch_price_history")
+    def test_price_jump_detected_via_clob(self, mock_fetch, now):
+        """CLOB price history with jump -> anomaly detected."""
+        mock_fetch.return_value = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.50},
+            {"t": 3000, "p": 0.75},  # 50% jump
+            {"t": 4000, "p": 0.74},
+        ]
+        m = self._make_anomaly_market(
+            now, volume="50000", volume24hr="1000", liquidity="50000"
+        )
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert any(a["type"] == "price_jump" for a in result["anomalies"])
+
+    @patch("polymarket_scanner._fetch_price_history")
+    def test_price_velocity_detected(self, mock_fetch, now):
+        """Rapid price acceleration -> detected."""
+        mock_fetch.return_value = [
+            {"t": i * 3600, "p": 0.40 + i * 0.04}
+            for i in range(8)
+        ]
+        m = self._make_anomaly_market(
+            now, volume="50000", volume24hr="1000", liquidity="50000"
+        )
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert any(a["type"] == "price_velocity" for a in result["anomalies"])
+
+    def test_below_min_volume_filtered(self, now):
+        """Market below ANOMALY_MIN_VOLUME -> no analysis."""
+        m = self._make_anomaly_market(now, volume="100")
+        result = detect_anomalies(m, now)
+        assert result is None
+
+    def test_below_min_liquidity_filtered(self, now):
+        """Market below ANOMALY_MIN_LIQUIDITY -> no analysis."""
+        m = self._make_anomaly_market(now, liquidity="500")
+        result = detect_anomalies(m, now)
+        assert result is None
+
+    def test_no_anomaly_on_normal_market(self, now):
+        """Normal market with no suspicious activity -> None."""
+        m = self._make_anomaly_market(
+            now,
+            volume="100000",
+            volume24hr="3000",  # ~3x daily avg (below 5x threshold)
+            liquidity="50000",
+        )
+        # No price history (no CLOB call)
+        with patch("polymarket_scanner._fetch_price_history", return_value=[]):
+            result = detect_anomalies(m, now)
+        assert result is None
+
+    def test_severity_classification(self, now):
+        """Severity labels assigned based on max severity score."""
+        # High severity: huge volume spike
+        m = self._make_anomaly_market(
+            now,
+            volume="10000",  # 10 day market: daily avg = 1000
+            volume24hr="50000",  # 50x daily avg
+            liquidity="3000",
+        )
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert result["severity_class"] in ("critical", "high", "moderate")
+        assert result["max_severity"] > 0
+
+    def test_multiple_anomalies_stacked(self, now):
+        """Market can have multiple simultaneous anomalies."""
+        m = self._make_anomaly_market(
+            now,
+            volume="10000",
+            volume24hr="100000",  # huge spike + VL imbalance
+            liquidity="2500",     # 100000/2500 = 40x (above 30x threshold)
+        )
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert result["anomaly_count"] >= 2
+        types = [a["type"] for a in result["anomalies"]]
+        assert "volume_spike" in types
+        assert "vl_imbalance" in types
+
+    def test_anomaly_output_fields(self, now):
+        """Anomaly report contains expected fields."""
+        m = self._make_anomaly_market(now)
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert "id" in result
+        assert "question" in result
+        assert "anomalies" in result
+        assert "max_severity" in result
+        assert "severity_label" in result
+        assert "severity_class" in result
+        assert "detected_at" in result
+        assert "category" in result
+        assert "url" in result
+
+    def test_bad_prices_handled(self, now):
+        """Invalid outcomePrices -> returns None gracefully."""
+        m = self._make_anomaly_market(now, outcomePrices="invalid_json")
+        result = detect_anomalies(m, now)
+        assert result is None
+
+    def test_no_clob_ids_still_works(self, now):
+        """No clobTokenIds -> volume anomalies still detected."""
+        m = self._make_anomaly_market(now, clobTokenIds="[]")
+        result = detect_anomalies(m, now)
+        # Should still detect volume spike even without price history
+        assert result is not None
+        assert any(a["type"] == "volume_spike" for a in result["anomalies"])
+
+
+class TestFetchPriceHistory:
+    """Test CLOB price history fetching."""
+
+    @patch("polymarket_scanner.requests.get")
+    def test_successful_fetch(self, mock_get):
+        """Successful API call -> returns history list."""
+        from polymarket_scanner import _anomaly_price_cache, _anomaly_price_lock
+        with _anomaly_price_lock:
+            _anomaly_price_cache.clear()
+        mock_resp = type('Response', (), {
+            'status_code': 200,
+            'raise_for_status': lambda self: None,
+            'json': lambda self: {
+                "history": [
+                    {"t": 1000, "p": 0.50},
+                    {"t": 2000, "p": 0.55},
+                    {"t": 3000, "p": 0.60},
+                ]
+            },
+        })()
+        mock_get.return_value = mock_resp
+        result = _fetch_price_history("token_test")
+        assert len(result) == 3
+        assert result[0]["p"] == 0.50
+        assert result[2]["p"] == 0.60
+
+    @patch("polymarket_scanner.requests.get")
+    def test_api_error_returns_empty(self, mock_get):
+        """API error -> returns empty list."""
+        from polymarket_scanner import _anomaly_price_cache, _anomaly_price_lock
+        with _anomaly_price_lock:
+            _anomaly_price_cache.clear()
+        mock_get.side_effect = ConnectionError("Network error")
+        result = _fetch_price_history("token_error")
+        assert result == []
+
+    @patch("polymarket_scanner.requests.get")
+    def test_cache_hit(self, mock_get):
+        """Second call within TTL -> uses cache, no API call."""
+        from polymarket_scanner import _anomaly_price_cache, _anomaly_price_lock
+        with _anomaly_price_lock:
+            _anomaly_price_cache.clear()
+        mock_resp = type('Response', (), {
+            'status_code': 200,
+            'raise_for_status': lambda self: None,
+            'json': lambda self: {
+                "history": [{"t": 1000, "p": 0.50}]
+            },
+        })()
+        mock_get.return_value = mock_resp
+        _fetch_price_history("token_cache")
+        _fetch_price_history("token_cache")
+        assert mock_get.call_count == 1  # only one API call

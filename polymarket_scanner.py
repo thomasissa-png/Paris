@@ -16,6 +16,12 @@ disagrees with market prices:
   - Elections:  RealClearPolitics polls vs. election/approval markets
   - Crypto:     CoinGecko prices vs. crypto price target markets
 
+Anomaly detection — suspicious trading activity scanner:
+  - Volume spikes:     24h volume vs. historical daily average (5× threshold)
+  - Price jumps:       Sudden >10% price movements from CLOB history
+  - Price velocity:    >15% acceleration over 6h window
+  - V/L imbalance:     Abnormal volume/liquidity ratio (>30×)
+
 Run:  pip install -r requirements.txt && python polymarket_scanner.py
 Open: http://localhost:5000
 
@@ -76,6 +82,17 @@ ODDS_CACHE_TTL = 300     # 5 min cache for sports odds
 # --- CLOB API (real spread verification) ---
 CLOB_API_BASE = "https://clob.polymarket.com"
 CLOB_CACHE_TTL = 30      # 30s cache for order books
+
+# --- Anomaly detection (trading anomaly scanner) ---
+ANOMALY_PRICE_CACHE_TTL = 120    # 2 min cache for price history
+ANOMALY_VOL_SPIKE_THRESHOLD = 5.0   # 24h vol > 5× daily avg = spike
+ANOMALY_PRICE_JUMP_PCT = 10.0       # >10% price jump in history = anomaly
+ANOMALY_PRICE_VELOCITY_PCT = 15.0   # >15% change in 6h window = anomaly
+ANOMALY_VL_RATIO_THRESHOLD = 30.0   # vol/liq > 30 = unusual money flow
+ANOMALY_MIN_VOLUME = 5000           # minimum volume to consider for anomalies
+ANOMALY_MIN_LIQUIDITY = 2000        # minimum liquidity to consider
+ANOMALY_PRICE_FIDELITY = 60         # 1h granularity for price history
+ANOMALY_PRICE_INTERVAL = "1d"       # fetch last 24h of price data
 
 # --- Notifications ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -2026,7 +2043,7 @@ _health_lock = threading.Lock()
 
 _ANALYZER_NAMES = [
     "weather", "finance", "earnings", "sports",
-    "fed_macro", "elections", "crypto",
+    "fed_macro", "elections", "crypto", "anomaly",
 ]
 
 
@@ -2045,6 +2062,12 @@ def _record_health(name: str, success: bool, detail: str = ""):
 
 _clob_cache: dict[str, tuple[float, dict]] = {}
 _clob_lock = threading.Lock()
+
+# --- Anomaly detection cache ---
+_anomaly_price_cache: dict[str, tuple[float, list]] = {}
+_anomaly_price_lock = threading.Lock()
+_anomaly_results_cache: list[dict] = []  # last scan's anomalies
+_anomaly_results_lock = threading.Lock()
 
 
 def _fetch_order_book(token_id: str) -> dict | None:
@@ -2125,6 +2148,321 @@ def verify_arb_execution(market: dict, prices: list[float]) -> dict:
         "total_spread_cost_pct": round(spread_cost_pct, 2),
         "effective_arb_pct": round(effective_arb, 2),
         "books": books,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trading Anomaly Detection — insider trading / suspicious activity scanner
+# ---------------------------------------------------------------------------
+
+
+def _fetch_price_history(token_id: str) -> list[dict]:
+    """Fetch hourly price history from CLOB prices-history endpoint.
+
+    Returns list of {t: unix_timestamp, p: price} dicts, newest last.
+    Uses 2 min cache per token to avoid excessive API calls.
+    """
+    now_ts = _time.time()
+    with _anomaly_price_lock:
+        # Purge expired entries
+        expired = [k for k, (ts, _) in _anomaly_price_cache.items()
+                   if now_ts - ts >= ANOMALY_PRICE_CACHE_TTL]
+        for k in expired:
+            del _anomaly_price_cache[k]
+        if token_id in _anomaly_price_cache:
+            ts, data = _anomaly_price_cache[token_id]
+            if now_ts - ts < ANOMALY_PRICE_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(
+            f"{CLOB_API_BASE}/prices-history",
+            params={
+                "market": token_id,
+                "interval": ANOMALY_PRICE_INTERVAL,
+                "fidelity": ANOMALY_PRICE_FIDELITY,
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        history = raw.get("history", [])
+        # Normalize: ensure each entry has 't' (timestamp) and 'p' (price)
+        result = []
+        for pt in history:
+            t = pt.get("t", 0)
+            p = pt.get("p", 0)
+            try:
+                result.append({"t": int(t), "p": float(p)})
+            except (TypeError, ValueError):
+                continue
+        with _anomaly_price_lock:
+            _anomaly_price_cache[token_id] = (_time.time(), result)
+        return result
+    except Exception:
+        return []
+
+
+def _detect_volume_spike(volume: float, volume_24h: float,
+                         start_date_str: str | None,
+                         created_at_str: str | None) -> dict | None:
+    """Detect abnormal volume spike: 24h volume vs historical daily average.
+
+    Returns anomaly dict or None.
+    """
+    if volume_24h <= 0 or volume <= 0:
+        return None
+    # Estimate days active from startDate or createdAt
+    days_active = 30.0  # conservative default
+    for ds in (start_date_str, created_at_str):
+        dt = parse_date(ds)
+        if dt:
+            delta = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+            if delta > 0:
+                days_active = max(delta, 1.0)
+                break
+    daily_avg = volume / days_active
+    if daily_avg <= 0:
+        return None
+    ratio = volume_24h / daily_avg
+    if ratio >= ANOMALY_VOL_SPIKE_THRESHOLD:
+        return {
+            "type": "volume_spike",
+            "severity": min(ratio / ANOMALY_VOL_SPIKE_THRESHOLD, 10.0),
+            "label": "Volume Anormal",
+            "description": (f"Volume 24h ${volume_24h:,.0f} = "
+                            f"{ratio:.1f}× la moyenne journalière "
+                            f"(${daily_avg:,.0f}/j)"),
+            "ratio": round(ratio, 1),
+            "volume_24h": volume_24h,
+            "daily_avg": round(daily_avg, 0),
+        }
+    return None
+
+
+def _detect_price_jumps(history: list[dict]) -> dict | None:
+    """Detect sudden large price jumps between consecutive data points.
+
+    Returns anomaly dict for the largest jump, or None.
+    """
+    if len(history) < 2:
+        return None
+    max_jump = 0.0
+    max_jump_from = 0.0
+    max_jump_to = 0.0
+    max_jump_time = 0
+    for i in range(1, len(history)):
+        p_prev = history[i - 1]["p"]
+        p_curr = history[i]["p"]
+        if p_prev <= 0:
+            continue
+        jump_pct = abs(p_curr - p_prev) / p_prev * 100
+        if jump_pct > max_jump:
+            max_jump = jump_pct
+            max_jump_from = p_prev
+            max_jump_to = p_curr
+            max_jump_time = history[i]["t"]
+    if max_jump >= ANOMALY_PRICE_JUMP_PCT:
+        direction = "hausse" if max_jump_to > max_jump_from else "baisse"
+        return {
+            "type": "price_jump",
+            "severity": min(max_jump / ANOMALY_PRICE_JUMP_PCT, 10.0),
+            "label": "Saut de Prix",
+            "description": (f"Mouvement brutal de {max_jump_from * 100:.0f}% → "
+                            f"{max_jump_to * 100:.0f}% "
+                            f"({direction} de {max_jump:.0f}% en 1h)"),
+            "jump_pct": round(max_jump, 1),
+            "price_from": round(max_jump_from, 4),
+            "price_to": round(max_jump_to, 4),
+            "timestamp": max_jump_time,
+        }
+    return None
+
+
+def _detect_price_velocity(history: list[dict]) -> dict | None:
+    """Detect rapid price acceleration over a 6h window.
+
+    Compares the first price in the window to the last — a large change
+    over just 6 hours signals unusual activity.
+    """
+    if len(history) < 3:
+        return None
+    # Use the last 6 data points (6h at 1h fidelity)
+    window = history[-6:] if len(history) >= 6 else history
+    p_start = window[0]["p"]
+    p_end = window[-1]["p"]
+    if p_start <= 0:
+        return None
+    velocity_pct = abs(p_end - p_start) / p_start * 100
+    if velocity_pct >= ANOMALY_PRICE_VELOCITY_PCT:
+        direction = "hausse" if p_end > p_start else "baisse"
+        hours = len(window)
+        return {
+            "type": "price_velocity",
+            "severity": min(velocity_pct / ANOMALY_PRICE_VELOCITY_PCT, 10.0),
+            "label": "Accélération de Prix",
+            "description": (f"Variation de {velocity_pct:.0f}% en ~{hours}h "
+                            f"({p_start * 100:.0f}% → {p_end * 100:.0f}%, "
+                            f"{direction})"),
+            "velocity_pct": round(velocity_pct, 1),
+            "price_start": round(p_start, 4),
+            "price_end": round(p_end, 4),
+            "window_hours": hours,
+        }
+    return None
+
+
+def _detect_volume_liquidity_imbalance(volume_24h: float,
+                                       liquidity: float) -> dict | None:
+    """Detect unusual volume/liquidity ratio — large bets on thin books.
+
+    High V/L signals someone is pushing through large orders regardless
+    of market depth, typical of informed/insider trading.
+    """
+    if liquidity <= 0 or volume_24h <= 0:
+        return None
+    vl_ratio = volume_24h / liquidity
+    if vl_ratio >= ANOMALY_VL_RATIO_THRESHOLD:
+        return {
+            "type": "vl_imbalance",
+            "severity": min(vl_ratio / ANOMALY_VL_RATIO_THRESHOLD, 10.0),
+            "label": "Déséquilibre Vol/Liq",
+            "description": (f"Volume 24h ${volume_24h:,.0f} sur liquidité "
+                            f"${liquidity:,.0f} — ratio {vl_ratio:.0f}× "
+                            f"(seuil: {ANOMALY_VL_RATIO_THRESHOLD:.0f}×)"),
+            "vl_ratio": round(vl_ratio, 1),
+            "volume_24h": volume_24h,
+            "liquidity": liquidity,
+        }
+    return None
+
+
+def detect_anomalies(market: dict, now: datetime) -> dict | None:
+    """Run all anomaly detectors on a market.
+
+    Returns an anomaly report dict or None if no anomalies found.
+    Anomaly report contains: market info + list of detected anomalies
+    with severity scores.
+    """
+    question = market.get("question", "") or market.get("title", "")
+    slug = market.get("slug", "")
+    condition_id = market.get("conditionId", "")
+    volume = parse_float(market.get("volume"))
+    volume_24h = parse_float(
+        market.get("volume24hr") or market.get("volume24Hr")
+        or market.get("volume_24h") or 0
+    )
+    liquidity = parse_float(market.get("liquidity"))
+
+    # --- Basic gates ---
+    if volume < ANOMALY_MIN_VOLUME:
+        return None
+    if liquidity < ANOMALY_MIN_LIQUIDITY:
+        return None
+
+    # --- Parse current prices ---
+    outcome_prices_raw = market.get("outcomePrices", "[]")
+    try:
+        prices = json.loads(outcome_prices_raw) if isinstance(
+            outcome_prices_raw, str) else outcome_prices_raw
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not prices or len(prices) < 2:
+        return None
+    float_prices = [parse_float(p) for p in prices]
+
+    outcomes_raw = market.get("outcomes", '["Yes", "No"]')
+    try:
+        outcomes = json.loads(outcomes_raw) if isinstance(
+            outcomes_raw, str) else outcomes_raw
+    except (json.JSONDecodeError, TypeError):
+        outcomes = []
+
+    # --- Collect anomalies ---
+    anomalies: list[dict] = []
+
+    # 1) Volume spike
+    vol_anom = _detect_volume_spike(
+        volume, volume_24h,
+        market.get("startDate"), market.get("createdAt"),
+    )
+    if vol_anom:
+        anomalies.append(vol_anom)
+
+    # 2) Volume/Liquidity imbalance
+    vl_anom = _detect_volume_liquidity_imbalance(volume_24h, liquidity)
+    if vl_anom:
+        anomalies.append(vl_anom)
+
+    # 3) Price-based anomalies (require CLOB price history)
+    clob_ids_raw = market.get("clobTokenIds", "[]")
+    try:
+        clob_ids = json.loads(clob_ids_raw) if isinstance(
+            clob_ids_raw, str) else clob_ids_raw
+    except (json.JSONDecodeError, TypeError):
+        clob_ids = []
+
+    price_history = []
+    if clob_ids and isinstance(clob_ids, list) and len(clob_ids) > 0:
+        # Fetch history for the first outcome (Yes / top outcome)
+        price_history = _fetch_price_history(clob_ids[0])
+
+    if price_history:
+        # 3a) Price jump detection
+        jump_anom = _detect_price_jumps(price_history)
+        if jump_anom:
+            anomalies.append(jump_anom)
+
+        # 3b) Price velocity
+        vel_anom = _detect_price_velocity(price_history)
+        if vel_anom:
+            anomalies.append(vel_anom)
+
+    if not anomalies:
+        return None
+
+    # --- Build anomaly report ---
+    # Compute composite severity (max of individual severities)
+    max_severity = max(a["severity"] for a in anomalies)
+    # Severity label
+    if max_severity >= 7.0:
+        severity_label = "critique"
+        severity_class = "critical"
+    elif max_severity >= 4.0:
+        severity_label = "élevé"
+        severity_class = "high"
+    else:
+        severity_label = "modéré"
+        severity_class = "moderate"
+
+    category = extract_category(market)
+
+    # Days left
+    end_dt = parse_date(market.get("endDate"))
+    days_left = 0.0
+    if end_dt:
+        delta_s = (end_dt - now).total_seconds()
+        days_left = max(delta_s / 86400.0, 0)
+
+    return {
+        "id": condition_id or slug or question[:40],
+        "question": question,
+        "slug": slug,
+        "url": f"https://polymarket.com/event/{slug}" if slug else "",
+        "category": category,
+        "volume": volume,
+        "volume_24h": volume_24h,
+        "liquidity": liquidity,
+        "prices": float_prices,
+        "outcomes": outcomes if isinstance(outcomes, list) else [],
+        "days_left": round(days_left, 1),
+        "anomalies": anomalies,
+        "anomaly_count": len(anomalies),
+        "max_severity": round(max_severity, 1),
+        "severity_label": severity_label,
+        "severity_class": severity_class,
+        "price_history": price_history[-24:] if price_history else [],
+        "detected_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
 
@@ -2307,6 +2645,36 @@ def _notify_new_opportunities(tiers: dict):
         _send_telegram_message(msg)
 
     _last_notified_ids = new_ids
+
+
+_last_notified_anomaly_ids: set[str] = set()
+
+
+def _notify_anomalies(anomalies: list[dict]):
+    """Send notifications for critical anomalies."""
+    global _last_notified_anomaly_ids
+    new_ids = set()
+    messages = []
+
+    for a in anomalies:
+        aid = a.get("id", "")
+        new_ids.add(aid)
+        if aid and aid not in _last_notified_anomaly_ids:
+            if a.get("severity_class") == "critical":
+                signals = ", ".join(
+                    an.get("label", "") for an in a.get("anomalies", [])
+                )
+                msg = (f"🚨 *ANOMALIE* | Sévérité {a.get('severity_label', '')}\n"
+                       f"{a.get('question', '')[:80]}\n"
+                       f"Signaux: {signals}\n"
+                       f"{a.get('url', '')}")
+                messages.append(msg)
+
+    for msg in messages[:3]:  # max 3 anomaly notifications per scan
+        _send_discord_webhook(msg)
+        _send_telegram_message(msg)
+
+    _last_notified_anomaly_ids = new_ids
 
 
 # ---------------------------------------------------------------------------
@@ -2868,6 +3236,8 @@ def scan() -> dict:
             "refreshed_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
             "categories": [],
             "tiers": {"edge": [], "super": [], "interesting": [], "watch": []},
+            "anomalies": [],
+            "anomaly_count": 0,
         }
 
     fetched = len(raw)
@@ -2901,6 +3271,35 @@ def scan() -> dict:
         for opp in tiers[tier_name]:
             _log_prediction(opp)
 
+    # --- Anomaly detection pass (runs on ALL fetched markets) ---
+    anomalies_list: list[dict] = []
+    seen_anomaly: set[str] = set()
+    anomaly_error = None
+    try:
+        for m in raw:
+            amid = m.get("conditionId") or m.get("slug") or ""
+            if amid:
+                if amid in seen_anomaly:
+                    continue
+                seen_anomaly.add(amid)
+            anomaly = detect_anomalies(m, now)
+            if anomaly:
+                anomalies_list.append(anomaly)
+        # Sort by severity (most suspicious first)
+        anomalies_list.sort(key=lambda x: -x["max_severity"])
+        # Keep top 50 to avoid bloating response
+        anomalies_list = anomalies_list[:50]
+        _record_health("anomaly", True,
+                       f"{len(anomalies_list)} anomalies detected")
+    except Exception as exc:
+        anomaly_error = str(exc)
+        _record_health("anomaly", False, anomaly_error)
+
+    # Cache anomaly results for /api/anomalies endpoint
+    with _anomaly_results_lock:
+        _anomaly_results_cache.clear()
+        _anomaly_results_cache.extend(anomalies_list)
+
     # --- Build result ---
     result = {
         "error": None,
@@ -2910,6 +3309,8 @@ def scan() -> dict:
         "refreshed_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "categories": sorted(cats),
         "tiers": tiers,
+        "anomalies": anomalies_list,
+        "anomaly_count": len(anomalies_list),
     }
 
     # --- Record scan history ---
@@ -2917,6 +3318,9 @@ def scan() -> dict:
 
     # --- Webhook notifications for new edge/super ---
     _notify_new_opportunities(tiers)
+
+    # --- Notify anomalies (critical severity) ---
+    _notify_anomalies(anomalies_list)
 
     # --- Analyzer health summary ---
     with _health_lock:
@@ -3133,6 +3537,33 @@ button{font-family:var(--font);cursor:pointer}
 .edge-confidence.medium{background:rgba(255,147,50,0.15);color:var(--pm-orange)}
 .edge-confidence.low{background:rgba(255,100,100,0.15);color:var(--pm-red)}
 
+/* ==========================================================================
+   ANOMALY SECTION
+   ========================================================================== */
+.anomaly-section{margin-bottom:32px}
+.anomaly-header{display:flex;align-items:center;gap:10px;padding:12px 0 10px;margin-bottom:12px;border-bottom:1px solid rgba(255,59,48,0.3)}
+.anomaly-label{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#ff3b30}
+.anomaly-count{font-size:11px;font-weight:600;padding:2px 8px;border-radius:var(--r-full);line-height:1.5;background:rgba(255,59,48,0.12);color:#ff3b30}
+.anomaly-card{background:var(--pm-bg-card);border:1px solid rgba(255,59,48,0.25);border-radius:var(--r-lg);padding:14px 14px 12px;display:flex;flex-direction:column;gap:10px;position:relative;overflow:hidden;transition:border-color .15s,background .15s}
+.anomaly-card:hover{border-color:rgba(255,59,48,0.45);background:var(--pm-bg-card-hover)}
+.anomaly-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px;background:#ff3b30}
+.anomaly-severity{font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:.4px}
+.severity-critical{background:rgba(255,59,48,0.2);color:#ff3b30;animation:pulse-sev 1.5s ease-in-out infinite}
+.severity-high{background:rgba(255,147,50,0.2);color:var(--pm-orange)}
+.severity-moderate{background:rgba(255,200,50,0.15);color:#ffc832}
+@keyframes pulse-sev{0%,100%{opacity:1}50%{opacity:.6}}
+.anomaly-signals{display:flex;flex-direction:column;gap:6px;width:100%}
+.anomaly-signal{padding:6px 8px;border-radius:6px;background:rgba(255,59,48,0.05);border:1px solid rgba(255,59,48,0.12);font-size:11px;color:var(--pm-text-secondary);line-height:1.4}
+.anomaly-signal strong{color:#ff3b30;font-weight:600}
+.signal-severity-bar{display:inline-block;height:4px;border-radius:2px;background:#ff3b30;margin-left:6px;vertical-align:middle}
+.anomaly-prices{display:flex;gap:6px}
+.anomaly-price-box{flex:1;display:flex;align-items:center;justify-content:center;gap:4px;padding:7px 6px;border-radius:var(--r-md);font-weight:700;font-size:13px}
+.anomaly-price-yes{background:var(--pm-green-soft);color:var(--pm-green)}
+.anomaly-price-no{background:var(--pm-red-soft);color:var(--pm-red)}
+.anomaly-mini-chart{width:100%;height:40px;position:relative;background:var(--pm-bg-surface);border-radius:var(--r-xs);overflow:hidden;border:1px solid var(--pm-border)}
+.anomaly-chart-line{fill:none;stroke:#ff3b30;stroke-width:1.5}
+.anomaly-chart-area{fill:rgba(255,59,48,0.08)}
+
 /* footer */
 .card-footer{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}
 .card-stats{display:flex;gap:10px;font-size:11.5px;color:var(--pm-text-tertiary)}
@@ -3221,7 +3652,8 @@ button{font-family:var(--font);cursor:pointer}
   <div class="stats-line" id="stats-line">
     Fetched <strong id="st-fetched">&mdash;</strong> markets &middot;
     <strong id="st-qualified">&mdash;</strong> qualified &middot;
-    <strong id="st-opps">&mdash;</strong> opportunities
+    <strong id="st-opps">&mdash;</strong> opportunities &middot;
+    <strong id="st-anomalies" style="color:#ff3b30">&mdash;</strong> anomalies
   </div>
   <div class="health-bar" id="health-bar"></div>
 
@@ -3236,6 +3668,14 @@ button{font-family:var(--font);cursor:pointer}
 
   <!-- content -->
   <div id="content" style="display:none">
+    <div class="anomaly-section" id="sec-anomaly" style="display:none">
+      <div class="anomaly-header">
+        <span class="tier-icon">&#128680;</span>
+        <span class="anomaly-label">Anomalies de Trading</span>
+        <span class="anomaly-count" id="cnt-anomaly">0</span>
+      </div>
+      <div class="card-grid" id="tier-anomaly"></div>
+    </div>
     <div class="tier-section tier-edge" id="sec-edge">
       <div class="tier-header">
         <span class="tier-icon">&#129504;</span>
@@ -3448,6 +3888,98 @@ function renderTier(gridId,countId,items){
   }
 }
 
+/* --- Render anomaly card --- */
+function renderMiniChart(history){
+  if(!history||history.length<2)return '';
+  var prices=history.map(function(h){return h.p});
+  var minP=Math.min.apply(null,prices),maxP=Math.max.apply(null,prices);
+  var range=maxP-minP||0.01;
+  var w=200,h=40;
+  var pts=history.map(function(pt,i){
+    var x=(i/(history.length-1))*w;
+    var y=h-((pt.p-minP)/range)*h;
+    return x.toFixed(1)+','+y.toFixed(1);
+  });
+  var lineStr=pts.join(' ');
+  var areaStr=pts.join(' ')+' '+w+','+h+' 0,'+h;
+  return '<svg class="anomaly-mini-chart" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none">'
+    +'<polygon class="anomaly-chart-area" points="'+areaStr+'"/>'
+    +'<polyline class="anomaly-chart-line" points="'+lineStr+'"/>'
+    +'</svg>';
+}
+
+function renderAnomalyCard(item){
+  var link=item.url?'<a href="'+esc(item.url)+'" target="_blank" rel="noopener">'+esc(item.question)+'</a>':esc(item.question);
+
+  /* severity badge */
+  var sevCls='severity-'+item.severity_class;
+  var bdg='<span class="anomaly-severity '+sevCls+'">'+esc(item.severity_label)+' ('+item.max_severity.toFixed(1)+')</span>';
+  if(item.days_left!==undefined){
+    var dl=item.days_left;
+    var dlTxt=dl<1?(dl*24).toFixed(1)+'h':Math.round(dl)+'d';
+    var urg=dl<=7;
+    bdg+='<span class="card-countdown '+(urg?'cd-urgent':'cd-normal')+'">'+dlTxt+'</span>';
+  }
+
+  /* prices */
+  var prHtml='';
+  if(item.prices&&item.prices.length>=2){
+    var yLbl=(item.outcomes&&item.outcomes[0])||'Yes';
+    var nLbl=(item.outcomes&&item.outcomes[1])||'No';
+    prHtml='<div class="anomaly-prices">'
+      +'<div class="anomaly-price-box anomaly-price-yes"><span class="price-label">'+esc(yLbl)+'</span><span>'+(item.prices[0]*100).toFixed(1)+'%</span></div>'
+      +'<div class="anomaly-price-box anomaly-price-no"><span class="price-label">'+esc(nLbl)+'</span><span>'+(item.prices[1]*100).toFixed(1)+'%</span></div>'
+      +'</div>';
+  }
+
+  /* mini chart */
+  var chartHtml=renderMiniChart(item.price_history);
+
+  /* anomaly signals */
+  var sigHtml='<div class="anomaly-signals">';
+  (item.anomalies||[]).forEach(function(a){
+    var barW=Math.min(a.severity/10*60,60);
+    sigHtml+='<div class="anomaly-signal"><strong>'+esc(a.label)+'</strong>: '+esc(a.description)
+      +'<span class="signal-severity-bar" style="width:'+barW+'px"></span></div>';
+  });
+  sigHtml+='</div>';
+
+  /* stats */
+  var st='<span>Vol <strong>'+fmtMoney(item.volume)+'</strong></span>';
+  if(item.volume_24h>0)st+='<span>24h <strong>'+fmtMoney(item.volume_24h)+'</strong></span>';
+  st+='<span>Liq <strong>'+fmtMoney(item.liquidity)+'</strong></span>';
+  st+='<span>Signaux <strong>'+item.anomaly_count+'</strong></span>';
+
+  var tg='<span class="category-tag">'+esc(item.category)+'</span>';
+
+  return '<div class="anomaly-card" data-category="'+esc(item.category)+'" data-id="'+esc(item.id)+'">'
+    +'<div class="card-top"><div class="card-question">'+link+'</div><div class="card-badges">'+bdg+'</div></div>'
+    +prHtml
+    +chartHtml
+    +sigHtml
+    +'<div class="card-footer"><div class="card-stats">'+st+'</div><div class="card-tags">'+tg+'</div></div>'
+    +'</div>';
+}
+
+function renderAnomalies(items){
+  var sec=document.getElementById('sec-anomaly');
+  var g=document.getElementById('tier-anomaly');
+  var c=document.getElementById('cnt-anomaly');
+  if(!items||items.length===0){
+    sec.style.display='none';
+    return;
+  }
+  sec.style.display='block';
+  c.textContent=items.length;
+  g.innerHTML=items.map(renderAnomalyCard).join('');
+  /* re-apply filter */
+  if(currentFilter!=='all'){
+    g.querySelectorAll('.anomaly-card').forEach(function(card){
+      if(card.dataset.category!==currentFilter)card.style.display='none';
+    });
+  }
+}
+
 /* --- Main refresh --- */
 function refresh(){
   if(isLoading)return;isLoading=true;
@@ -3465,14 +3997,15 @@ function refresh(){
     document.getElementById('st-fetched').textContent=d.fetched;
     document.getElementById('st-qualified').textContent=d.qualified;
     document.getElementById('st-opps').textContent=d.total_opps;
+    document.getElementById('st-anomalies').textContent=d.anomaly_count||0;
     document.getElementById('topbar-opps').textContent=d.total_opps+' opportunit'+(d.total_opps!==1?'ies':'y');
 
     /* analyzer health bar */
     var hb=document.getElementById('health-bar');
     if(hb&&d.analyzer_health){
       var hhtml='<span style="color:var(--pm-text-tertiary);font-weight:600">Analyzers:</span>';
-      var names=['weather','finance','earnings','sports','fed_macro','elections','crypto'];
-      var labels={weather:'Meteo',finance:'Finance',earnings:'Earnings',sports:'Sports',fed_macro:'Fed',elections:'Elections',crypto:'Crypto'};
+      var names=['weather','finance','earnings','sports','fed_macro','elections','crypto','anomaly'];
+      var labels={weather:'Meteo',finance:'Finance',earnings:'Earnings',sports:'Sports',fed_macro:'Fed',elections:'Elections',crypto:'Crypto',anomaly:'Anomalies'};
       names.forEach(function(n){
         var h=d.analyzer_health[n];
         var cls=h?((h.status==='ok')?'health-ok':'health-err'):'health-na';
@@ -3502,7 +4035,10 @@ function refresh(){
     previousIds=curIds;
     if(hasNewSuper)playAlert();
 
-    /* render */
+    /* render anomalies first */
+    renderAnomalies(d.anomalies||[]);
+
+    /* render tiers */
     renderTier('tier-edge','cnt-edge',d.tiers.edge||[]);
     renderTier('tier-super','cnt-super',d.tiers['super']);
     renderTier('tier-int','cnt-int',d.tiers.interesting);
@@ -3635,6 +4171,16 @@ def api_predictions():
         return jsonify([])
 
 
+@app.route("/api/anomalies")
+def api_anomalies():
+    """Return latest detected trading anomalies."""
+    with _anomaly_results_lock:
+        return jsonify({
+            "anomalies": list(_anomaly_results_cache),
+            "count": len(_anomaly_results_cache),
+        })
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3707,6 +4253,7 @@ def _validate_api_keys():
     print("  [OK] Elections/Polls — no key needed (RCP + base rates)")
     # --- CLOB API ---
     print("  [OK] Polymarket CLOB — no key needed (spread verification)")
+    print("  [OK] Anomaly Detector — no key needed (volume spikes, price jumps)")
     # --- Notifications ---
     if DISCORD_WEBHOOK_URL:
         print(f"  [OK] Discord webhook configured")
