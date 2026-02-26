@@ -27,11 +27,13 @@ from unittest.mock import patch
 
 from polymarket_scanner import (
     CITY_COORDS,
+    COINGECKO_MIN_INTERVAL,
     CRYPTO_TICKERS,
     EST_FEE_PCT,
     FINANCE_TICKERS,
     FRED_SERIES,
     MAX_ANN_ROI,
+    MAX_SCAN_HISTORY,
     MIN_EDGE,
     MIN_LIQUIDITY,
     SPORT_KEYS,
@@ -43,6 +45,7 @@ from polymarket_scanner import (
     _INFLATION_RE,
     _UNEMPLOYMENT_RE,
     _GDP_RE,
+    _cg_rate_limit,
     _consensus_probability,
     _find_city,
     _find_crypto_ticker,
@@ -51,9 +54,13 @@ from polymarket_scanner import (
     _find_ticker,
     _has_draw_market,
     _horizon_confidence,
+    _log_prediction,
     _match_event,
     _normal_cdf,
     _parse_target_date,
+    _rate_trend_probabilities,
+    _record_health,
+    _record_scan_history,
     _to_fahrenheit,
     analyze_crypto,
     analyze_earnings,
@@ -66,11 +73,13 @@ from polymarket_scanner import (
     compute_score,
     extract_category,
     is_crypto,
+    kelly_fraction,
     parse_date,
     parse_float,
     process_market,
     run_analyzers,
     truncate,
+    verify_arb_execution,
 )
 
 
@@ -2286,13 +2295,15 @@ class TestFedMacroAnalyzer:
         assert result["estimated_prob"] == 0.75
         assert result["source"] == "FRED / Fed Analysis"
 
+    @patch("polymarket_scanner._fetch_fred_trend")
     @patch("polymarket_scanner._fetch_fred_series")
-    def test_fed_cut_with_rate(self, mock_fred):
+    def test_fed_cut_with_rate(self, mock_fred, mock_trend):
         mock_fred.return_value = 5.25
+        mock_trend.return_value = []  # no trend data → fallback base rates
         end = datetime.now(timezone.utc) + timedelta(days=5)
         result = analyze_fed_macro("Will the Fed cut rates?", end)
         assert result is not None
-        assert result["estimated_prob"] == 0.30
+        assert result["estimated_prob"] == 0.15  # trend fallback: cut=15%
 
     @patch("polymarket_scanner._fetch_fred_series")
     def test_fed_hike_low_prob(self, mock_fred):
@@ -2721,8 +2732,13 @@ class TestRunAnalyzersExpanded:
     @patch("polymarket_scanner.analyze_weather")
     def test_order_weather_first(self, mock_w, mock_f, mock_e,
                                   mock_s, mock_m, mock_el, mock_c):
-        mock_w.return_value = {"source": "Weather"}
-        mock_f.return_value = {"source": "Finance"}
+        mock_w.return_value = {"source": "Weather", "estimated_prob": 0.9, "confidence": "high"}
+        mock_f.return_value = {"source": "Finance", "estimated_prob": 0.5, "confidence": "medium"}
+        mock_e.return_value = None
+        mock_s.return_value = None
+        mock_m.return_value = None
+        mock_el.return_value = None
+        mock_c.return_value = None
         end = datetime.now(timezone.utc) + timedelta(days=5)
         result = run_analyzers("question", end)
         assert result["source"] == "Weather"
@@ -2737,8 +2753,12 @@ class TestRunAnalyzersExpanded:
     def test_finance_before_earnings(self, mock_w, mock_f, mock_e,
                                       mock_s, mock_m, mock_el, mock_c):
         mock_w.return_value = None
-        mock_f.return_value = {"source": "Finance"}
-        mock_e.return_value = {"source": "Earnings"}
+        mock_f.return_value = {"source": "Finance", "estimated_prob": 0.7, "confidence": "high"}
+        mock_e.return_value = {"source": "Earnings", "estimated_prob": 0.6, "confidence": "medium"}
+        mock_s.return_value = None
+        mock_m.return_value = None
+        mock_el.return_value = None
+        mock_c.return_value = None
         end = datetime.now(timezone.utc) + timedelta(days=5)
         result = run_analyzers("question", end)
         assert result["source"] == "Finance"
@@ -2754,8 +2774,11 @@ class TestRunAnalyzersExpanded:
                                      mock_s, mock_m, mock_el, mock_c):
         mock_w.return_value = None
         mock_f.return_value = None
-        mock_e.return_value = {"source": "Earnings"}
-        mock_s.return_value = {"source": "Sports"}
+        mock_e.return_value = {"source": "Earnings", "estimated_prob": 0.75, "confidence": "high"}
+        mock_s.return_value = {"source": "Sports", "estimated_prob": 0.6, "confidence": "medium"}
+        mock_m.return_value = None
+        mock_el.return_value = None
+        mock_c.return_value = None
         end = datetime.now(timezone.utc) + timedelta(days=5)
         result = run_analyzers("question", end)
         assert result["source"] == "Earnings"
@@ -2773,7 +2796,9 @@ class TestRunAnalyzersExpanded:
         mock_f.return_value = None
         mock_e.return_value = None
         mock_s.return_value = None
-        mock_m.return_value = {"source": "FRED"}
+        mock_m.return_value = {"source": "FRED", "estimated_prob": 0.7, "confidence": "medium"}
+        mock_el.return_value = None
+        mock_c.return_value = None
         end = datetime.now(timezone.utc) + timedelta(days=5)
         result = run_analyzers("question", end)
         assert result["source"] == "FRED"
@@ -2849,6 +2874,463 @@ class TestCryptoGateUpdated:
         """Crypto discussion question → filtered."""
         m = _make_market(now, question="Will Ethereum switch to proof of stake again?")
         assert process_market(m, now) is None
+
+
+# =========================================================================
+# v6 — Kelly Criterion
+# =========================================================================
+
+class TestKellyCriterion:
+    """Test Kelly fraction calculation."""
+
+    def test_edge_bet(self):
+        """60% win prob at 50c → Kelly = (1*0.6-0.4)/1 = 0.2 = 20%."""
+        f = kelly_fraction(0.6, 0.50)
+        assert abs(f - 0.20) < 0.01
+
+    def test_fair_bet_zero(self):
+        """50% win prob at 50c → Kelly = 0 (no edge)."""
+        f = kelly_fraction(0.5, 0.50)
+        assert f == 0.0
+
+    def test_negative_edge_zero(self):
+        """40% win prob at 50c → negative Kelly → capped at 0."""
+        f = kelly_fraction(0.4, 0.50)
+        assert f == 0.0
+
+    def test_capped_at_25pct(self):
+        """Very strong edge → capped at 25%."""
+        f = kelly_fraction(0.99, 0.10)
+        assert f == 0.25
+
+    def test_edge_zero_price(self):
+        """Price 0 → Kelly 0."""
+        assert kelly_fraction(0.6, 0.0) == 0.0
+
+    def test_edge_one_price(self):
+        """Price 1.0 → Kelly 0."""
+        assert kelly_fraction(0.6, 1.0) == 0.0
+
+    def test_small_edge(self):
+        """55% at 50c → Kelly ~0.10."""
+        f = kelly_fraction(0.55, 0.50)
+        assert 0.05 < f < 0.15
+
+
+# =========================================================================
+# v6 — CoinGecko Rate Limiter
+# =========================================================================
+
+class TestCoinGeckoRateLimit:
+    """Test CoinGecko rate limiting."""
+
+    def test_min_interval_configured(self):
+        assert COINGECKO_MIN_INTERVAL >= 1.0
+
+    def test_rate_limit_function_exists(self):
+        """_cg_rate_limit should be callable."""
+        assert callable(_cg_rate_limit)
+
+
+# =========================================================================
+# v6 — CLOB Verification
+# =========================================================================
+
+class TestCLOBVerification:
+    """Test CLOB spread verification."""
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_executable_arb(self, mock_book):
+        """Arb with tight spread → executable."""
+        mock_book.return_value = {
+            "best_bid": 0.44, "best_ask": 0.45,
+            "spread": 0.01, "spread_pct": 2.2,
+            "bid_depth": 1000, "ask_depth": 1000,
+        }
+        market = {"clobTokenIds": '["token1", "token2"]'}
+        prices = [0.45, 0.48]  # sum=0.93, deviation=7%
+        result = verify_arb_execution(market, prices)
+        assert result["executable"] is True
+        assert result["total_spread_cost_pct"] > 0
+        assert result["effective_arb_pct"] > 0
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_not_executable_wide_spread(self, mock_book):
+        """Arb with wide spread → not executable."""
+        mock_book.return_value = {
+            "best_bid": 0.40, "best_ask": 0.48,
+            "spread": 0.08, "spread_pct": 16.7,
+            "bid_depth": 100, "ask_depth": 100,
+        }
+        market = {"clobTokenIds": '["token1", "token2"]'}
+        prices = [0.48, 0.49]  # sum=0.97, deviation=3%
+        result = verify_arb_execution(market, prices)
+        assert result["executable"] is False
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_no_clob_ids(self, mock_book):
+        """Market without clobTokenIds → executable=None."""
+        market = {}
+        result = verify_arb_execution(market, [0.45, 0.48])
+        assert result["executable"] is None
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_clob_api_failure(self, mock_book):
+        """CLOB API failure → books empty."""
+        mock_book.return_value = None
+        market = {"clobTokenIds": '["token1"]'}
+        result = verify_arb_execution(market, [0.45])
+        assert result["books"] == [None]
+
+
+# =========================================================================
+# v6 — Health Tracking
+# =========================================================================
+
+class TestHealthTracking:
+    """Test analyzer health tracking."""
+
+    def test_record_health_ok(self):
+        _record_health("test_analyzer", True, "test")
+        from polymarket_scanner import _analyzer_health
+        assert "test_analyzer" in _analyzer_health
+        assert _analyzer_health["test_analyzer"]["status"] == "ok"
+
+    def test_record_health_error(self):
+        _record_health("test_analyzer2", False, "connection timeout")
+        from polymarket_scanner import _analyzer_health
+        assert _analyzer_health["test_analyzer2"]["status"] == "error"
+        assert "timeout" in _analyzer_health["test_analyzer2"]["detail"]
+
+
+# =========================================================================
+# v6 — Fed Rate Trend Probabilities
+# =========================================================================
+
+class TestRateTrendProbabilities:
+    """Test trend-based Fed rate probability model."""
+
+    def test_no_trend_data_fallback(self):
+        """Empty trend → fallback base rates."""
+        probs = _rate_trend_probabilities(5.25, [])
+        assert abs(probs["hold"] + probs["cut"] + probs["hike"] - 1.0) < 0.01
+
+    def test_all_holds_trend(self):
+        """Constant rate → very high hold probability."""
+        trend = [5.25, 5.25, 5.25, 5.25, 5.25]
+        probs = _rate_trend_probabilities(5.25, trend)
+        assert probs["hold"] > 0.80
+
+    def test_cutting_cycle(self):
+        """Rate declining → higher cut probability."""
+        trend = [4.75, 5.00, 5.25, 5.50, 5.50]  # recent = most first
+        probs = _rate_trend_probabilities(4.75, trend)
+        assert probs["cut"] > probs["hike"]
+
+    def test_hiking_cycle(self):
+        """Rate rising → higher hike probability."""
+        trend = [5.50, 5.25, 5.00, 4.75, 4.50]  # recent = most first
+        probs = _rate_trend_probabilities(5.50, trend)
+        assert probs["hike"] > probs["cut"]
+
+    def test_probs_sum_to_one(self):
+        """Probabilities should always sum to ~1.0."""
+        for trend in [
+            [5.25, 5.25, 5.25],
+            [4.75, 5.00, 5.25],
+            [5.50, 5.25, 5.00],
+            [],
+        ]:
+            probs = _rate_trend_probabilities(5.25, trend)
+            total = probs["hold"] + probs["cut"] + probs["hike"]
+            assert abs(total - 1.0) < 0.02, f"Sum={total} for trend={trend}"
+
+
+# =========================================================================
+# v6 — Earnings with Revisions
+# =========================================================================
+
+class TestEarningsRevisions:
+    """Test earnings analyzer with revision data."""
+
+    @patch("polymarket_scanner._fetch_earnings_data")
+    def test_upward_revision_boosts_beat(self, mock_fetch):
+        """Upward revisions → higher beat probability."""
+        mock_fetch.return_value = {
+            "ticker": "TSLA", "beat_rate": 0.65,
+            "est_eps": 1.50, "num_quarters": 4,
+            "revision_trend": 0.05,  # +5% revision
+            "revenue_growth": 0.15,
+        }
+        end = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_earnings("Will Tesla beat earnings?", end)
+        assert result is not None
+        # 65% base + 5% revision boost + 3% revenue boost
+        assert result["estimated_prob"] > 0.65
+
+    @patch("polymarket_scanner._fetch_earnings_data")
+    def test_downward_revision_hurts_beat(self, mock_fetch):
+        """Downward revisions → lower beat probability."""
+        mock_fetch.return_value = {
+            "ticker": "TSLA", "beat_rate": 0.65,
+            "est_eps": 1.50, "num_quarters": 4,
+            "revision_trend": -0.05,
+            "revenue_growth": None,
+        }
+        end = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_earnings("Will Tesla beat earnings?", end)
+        assert result is not None
+        assert result["estimated_prob"] < 0.65
+
+    @patch("polymarket_scanner._fetch_earnings_data")
+    def test_no_revision_data_unchanged(self, mock_fetch):
+        """No revision data → base beat rate unchanged."""
+        mock_fetch.return_value = {
+            "ticker": "TSLA", "beat_rate": 0.75,
+            "est_eps": 1.25, "num_quarters": 4,
+            "revision_trend": 0.0,
+            "revenue_growth": None,
+        }
+        end = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_earnings("Will Tesla beat earnings?", end)
+        assert result is not None
+        assert result["estimated_prob"] == 0.75
+
+
+# =========================================================================
+# v6 — Prediction Logging
+# =========================================================================
+
+class TestPredictionLogging:
+    """Test prediction logging to JSONL."""
+
+    def test_log_prediction_writes(self, tmp_path):
+        """Prediction should be written to file."""
+        import polymarket_scanner
+        old_path = polymarket_scanner.PREDICTIONS_LOG_FILE
+        polymarket_scanner.PREDICTIONS_LOG_FILE = str(tmp_path / "test_predictions.jsonl")
+        try:
+            opp = {
+                "id": "test123", "question": "Test?",
+                "tier": "edge", "score": 100,
+                "yes": 0.5, "no": 0.5, "price_sum": 1.0,
+                "liquidity": 10000, "volume": 5000,
+                "trade_label": "BUY YES", "trade_side_class": "yes",
+                "ev_per_100": 5.0, "net_per_100": 3.0, "kelly_pct": 10.0,
+                "edge_analysis": {
+                    "source": "Test", "estimated_prob": 0.6,
+                    "edge": 0.1, "confidence": "high",
+                },
+            }
+            _log_prediction(opp)
+            with open(polymarket_scanner.PREDICTIONS_LOG_FILE) as f:
+                lines = f.readlines()
+            assert len(lines) == 1
+            data = json.loads(lines[0])
+            assert data["market_id"] == "test123"
+            assert data["edge"]["source"] == "Test"
+        finally:
+            polymarket_scanner.PREDICTIONS_LOG_FILE = old_path
+
+
+# =========================================================================
+# v6 — Scan History
+# =========================================================================
+
+class TestScanHistory:
+    """Test historical scan tracking."""
+
+    def test_record_scan_history(self):
+        """Scan history should be recorded."""
+        from polymarket_scanner import _scan_history, _history_lock
+        with _history_lock:
+            _scan_history.clear()
+
+        scan_data = {
+            "refreshed_at": "2026-02-26 12:00:00 UTC",
+            "total_opps": 5,
+            "tiers": {
+                "edge": [{"question": "Q1", "tier": "edge", "score": 100, "ev_per_100": 5}],
+                "super": [],
+                "interesting": [],
+                "watch": [],
+            },
+        }
+        _record_scan_history(scan_data)
+        with _history_lock:
+            assert len(_scan_history) == 1
+            assert _scan_history[0]["total_opps"] == 5
+            assert len(_scan_history[0]["top_opportunities"]) == 1
+
+
+# =========================================================================
+# v6 — process_market outputs Kelly and CLOB
+# =========================================================================
+
+class TestProcessMarketV6:
+    """Test that process_market includes Kelly and CLOB data."""
+
+    @pytest.fixture
+    def now(self):
+        return datetime.now(timezone.utc)
+
+    @patch("polymarket_scanner.verify_arb_execution")
+    @patch("polymarket_scanner.run_analyzers")
+    def test_arb_has_kelly_25(self, mock_run, mock_clob, now):
+        """Arb opportunities should have Kelly=25%."""
+        mock_run.return_value = None
+        mock_clob.return_value = {"executable": None, "total_spread_cost_pct": 0,
+                                   "effective_arb_pct": 0, "books": []}
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert result["kelly_pct"] == 25.0
+
+    @patch("polymarket_scanner.verify_arb_execution")
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_has_kelly_calculated(self, mock_run, mock_clob, now):
+        """Edge opportunities should have Kelly > 0."""
+        mock_run.return_value = {
+            "estimated_prob": 0.70,
+            "source": "Yahoo Finance",
+            "analysis": "test",
+            "confidence": "high",
+        }
+        mock_clob.return_value = {"executable": None, "total_spread_cost_pct": 0,
+                                   "effective_arb_pct": 0, "books": []}
+        m = _make_market(now, outcomePrices='["0.50", "0.50"]')
+        result = process_market(m, now)
+        assert result is not None
+        if result["tier"] == "edge":
+            assert result["kelly_pct"] > 0
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_clob_data_present_for_arb(self, mock_run, now):
+        """Arb results should include clob_data."""
+        mock_run.return_value = None
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert "clob_data" in result
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_kelly_pct_in_result(self, mock_run, now):
+        """kelly_pct should always be in result."""
+        mock_run.return_value = None
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert "kelly_pct" in result
+
+
+# =========================================================================
+# v6 — Multi-analyzer picks best confidence
+# =========================================================================
+
+class TestMultiAnalyzerFusion:
+    """Test that multi-analyzer picks best by confidence."""
+
+    @patch("polymarket_scanner.analyze_crypto")
+    @patch("polymarket_scanner.analyze_elections")
+    @patch("polymarket_scanner.analyze_fed_macro")
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_earnings")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_high_confidence_wins(self, mock_w, mock_f, mock_e,
+                                    mock_s, mock_m, mock_el, mock_c):
+        """Higher confidence analyzer should win over lower."""
+        mock_w.return_value = {"source": "Weather", "estimated_prob": 0.6, "confidence": "low"}
+        mock_f.return_value = {"source": "Finance", "estimated_prob": 0.7, "confidence": "high"}
+        mock_e.return_value = None
+        mock_s.return_value = None
+        mock_m.return_value = None
+        mock_el.return_value = None
+        mock_c.return_value = None
+        end = datetime.now(timezone.utc) + timedelta(days=5)
+        result = run_analyzers("question", end)
+        assert result["source"] == "Finance"
+
+    @patch("polymarket_scanner.analyze_crypto")
+    @patch("polymarket_scanner.analyze_elections")
+    @patch("polymarket_scanner.analyze_fed_macro")
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_earnings")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_single_result_returned_directly(self, mock_w, mock_f, mock_e,
+                                               mock_s, mock_m, mock_el, mock_c):
+        """Single analyzer match → returned without sorting."""
+        mock_w.return_value = None
+        mock_f.return_value = {"source": "Finance", "estimated_prob": 0.5}
+        mock_e.return_value = None
+        mock_s.return_value = None
+        mock_m.return_value = None
+        mock_el.return_value = None
+        mock_c.return_value = None
+        end = datetime.now(timezone.utc) + timedelta(days=5)
+        result = run_analyzers("question", end)
+        assert result["source"] == "Finance"
+
+    @patch("polymarket_scanner.analyze_crypto")
+    @patch("polymarket_scanner.analyze_elections")
+    @patch("polymarket_scanner.analyze_fed_macro")
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_earnings")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_also_analyzed_by_populated(self, mock_w, mock_f, mock_e,
+                                          mock_s, mock_m, mock_el, mock_c):
+        """Multiple matches → also_analyzed_by field populated."""
+        mock_w.return_value = {"source": "Weather", "estimated_prob": 0.8, "confidence": "high"}
+        mock_f.return_value = {"source": "Finance", "estimated_prob": 0.6, "confidence": "low"}
+        mock_e.return_value = None
+        mock_s.return_value = None
+        mock_m.return_value = None
+        mock_el.return_value = None
+        mock_c.return_value = None
+        end = datetime.now(timezone.utc) + timedelta(days=5)
+        result = run_analyzers("question", end)
+        assert "also_analyzed_by" in result
+        assert len(result["also_analyzed_by"]) == 1
+
+
+# =========================================================================
+# v6 — Yahoo Finance Fallback
+# =========================================================================
+
+class TestYahooFallback:
+    """Test Yahoo Finance endpoint fallback."""
+
+    @patch("polymarket_scanner.requests.get")
+    def test_fallback_to_query2(self, mock_get):
+        """If query1 fails, should try query2."""
+        from polymarket_scanner import _fetch_yahoo_chart, _finance_cache, _finance_lock
+        # Clear cache first
+        with _finance_lock:
+            _finance_cache.clear()
+
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise ConnectionError("query1 down")
+            # Return valid response for query2
+            mock_resp = type('Response', (), {
+                'status_code': 200,
+                'raise_for_status': lambda self: None,
+                'json': lambda self: {"chart": {"result": [{
+                    "meta": {"regularMarketPrice": 100},
+                    "indicators": {"quote": [{"close": [95 + i for i in range(20)]}]},
+                }]}},
+            })()
+            return mock_resp
+
+        mock_get.side_effect = side_effect
+        result = _fetch_yahoo_chart("TEST")
+        assert result is not None
+        assert result["price"] == 100
+        assert call_count[0] >= 2  # tried at least 2 endpoints
 
     @pytest.fixture
     def now(self):

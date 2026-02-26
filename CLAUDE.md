@@ -3,6 +3,8 @@
 ## Project Overview
 Single-file Flask web app (`polymarket_scanner.py`) that scans Polymarket prediction markets via the Gamma API and detects short-term trading opportunities ranked by attractiveness.
 
+**Version**: v6 — adds CLOB spread verification, Kelly criterion, prediction logging, webhook alerts, portfolio tracking, historical scans, multi-analyzer fusion, enhanced earnings/Fed models, Yahoo fallback, CoinGecko rate limiting, health dashboard.
+
 **Stack**: Python 3.10+, Flask, requests. No external CSS frameworks — all inline styles matching Polymarket's brand identity.
 
 **Run**: `pip install -r requirements.txt && python polymarket_scanner.py` → http://localhost:5000
@@ -170,13 +172,86 @@ The scanner runs 7 analyzers to detect informational edge. Analyzers are **optio
 - **Temperature regex**: anchored — prefers `80F` (number+unit) over `5` (bare number). Fallback to number after directional keyword
 - **Yahoo Finance logging**: HTTP errors, timeouts logged via `_logger` — no silent failures
 
+## v6 Features (Audit Implementation)
+
+### CLOB Spread Verification (A)
+- **API**: `https://clob.polymarket.com/book?token_id={id}` — no key needed
+- **Function**: `verify_arb_execution()` — checks real bid/ask spread for each outcome
+- **Integration**: Called in `process_market()` for all arbs — updates `spread_warning` with CLOB data
+- **Cache**: 30s TTL per token, thread-safe
+- **Frontend**: Shows CLOB spread cost %, net arb %, checkmark/cross for executability
+
+### Kelly Criterion (K)
+- **Formula**: `f* = (bp - q) / b` where b = net odds, p = win_prob, q = 1-p
+- **Cap**: 25% max (full Kelly too aggressive)
+- **Arbs**: Fixed 25% display (guaranteed profit)
+- **Edge**: Calculated from estimated_prob and buy_price
+- **Frontend**: `Kelly: X.X%` badge on each opportunity
+
+### Multi-Analyzer Fusion (I)
+- **Old**: First-match-wins (deterministic order)
+- **New**: ALL analyzers run, best picked by confidence then edge extremity
+- **Tie-breaking**: Higher confidence wins; then `|estimated_prob - 0.5|` (extremity)
+- **`also_analyzed_by`**: When multiple match, other sources noted in result
+
+### Fed Rate Trend Model (B)
+- **Old**: Static base rates (hold=75%, cut=30%, hike=10%)
+- **New**: `_rate_trend_probabilities()` — analyzes last 12 FRED observations
+- **Logic**: Counts holds vs changes, detects cutting/hiking cycle momentum
+- **Fallback**: Still works without FRED key (static fallback)
+
+### Enhanced Earnings (E)
+- **Analyst revisions**: `epsTrend` from earningsTrend module — upward/downward revision adjusts beat probability ±5%
+- **Revenue growth**: From financialsChart yearly data — strong growth adds +3% to beat probability
+- **Analysis text**: Includes revision direction and revenue growth
+
+### Yahoo Finance Fallback (D)
+- **Primary**: `query1.finance.yahoo.com`
+- **Fallback**: `query2.finance.yahoo.com` — tried if primary fails
+- **Applies to**: Both chart endpoint (finance analyzer) and quoteSummary (earnings analyzer)
+
+### CoinGecko Rate Limiting (G)
+- **`_cg_rate_limit()`**: Enforces `COINGECKO_MIN_INTERVAL` (2s) between requests
+- **Thread-safe**: Uses `_cg_rate_lock`
+- **Prevents**: 429 rate limit errors on free tier
+
+### Prediction Logging (C)
+- **File**: `predictions.jsonl` (configurable via `PREDICTIONS_LOG` env var)
+- **Format**: One JSON object per line with timestamp, market state, trade details, edge data
+- **Logged**: All edge/super/interesting opportunities per scan
+- **API**: `GET /api/predictions` — returns last 100 predictions
+
+### Webhook Notifications (J)
+- **Discord**: `DISCORD_WEBHOOK_URL` env var — POST to webhook
+- **Telegram**: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` env vars
+- **Triggers**: New edge/super opportunities (max 5 per scan)
+- **Dedup**: Tracks `_last_notified_ids` to avoid repeat notifications
+
+### Portfolio Tracker (L)
+- **File**: `portfolio.json` (configurable via `PORTFOLIO_FILE` env var)
+- **API**: `GET /api/portfolio`, `POST /api/portfolio`, `DELETE /api/portfolio/<id>`
+- **Fields**: market_id, question, side, price, amount, timestamp, status
+
+### Historical Scans (O)
+- **In-memory**: Last 10 scan summaries
+- **API**: `GET /api/history`
+- **Data**: Tier counts, top opportunities per scan
+
+### Health Dashboard (M)
+- **Tracking**: `_record_health()` called per analyzer per scan
+- **API**: `GET /api/health` — analyzer status, active count
+- **Frontend**: Color-coded dots per analyzer in health bar
+
+### Float Guard (N)
+- Handled by existing 2% minimum arb filter — arbs with `deviation < 0.02` already excluded
+
 ## Testing
 **ALWAYS run tests before committing**:
 ```bash
 python -m pytest tests/ -v
 ```
 
-Test file: `tests/test_scanner.py` (361 tests) — covers:
+Test file: `tests/test_scanner.py` (394 tests) — covers:
 - classify(): arb tiers (super/interesting), edge tier (before 0.995), near-certain watch-only, overround excluded, boundaries
 - compute_score(): edge > arb >> near-certain, time/liquidity weighting, confidence multiplier
 - Weather analyzer: city detection, sigmoid temp, composite rain, flexible keywords, horizon confidence, mocked OWM API
@@ -196,6 +271,9 @@ Test file: `tests/test_scanner.py` (361 tests) — covers:
 - Updated run_analyzers: 7-analyzer chain order verification, all-None fallback
 - Crypto gate: price target markets pass through, generic crypto still filtered
 - Cleanup: "la" alias removed, OWM cache purge, normal CDF helper
+- v6: Kelly criterion (7 tests), CoinGecko rate limit (2), CLOB verification (4), health tracking (2)
+- v6: Rate trend probabilities (5), earnings revisions (3), prediction logging (1), scan history (1)
+- v6: process_market v6 outputs (4), multi-analyzer fusion (3), Yahoo fallback (1)
 
 ## File Structure
 ```

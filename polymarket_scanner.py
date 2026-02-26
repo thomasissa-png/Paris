@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Polymarket Live Opportunity Scanner v5
+Polymarket Live Opportunity Scanner v6
 =======================================
 Full trading intelligence: ROI, annualized returns, mispricing direction,
-multi-outcome support, category filtering, smart scoring.
+multi-outcome support, category filtering, smart scoring, Kelly sizing,
+CLOB spread verification, prediction logging, webhook alerts.
 
 Edge informationnel — 7 analyzers detect markets where external data
 disagrees with market prices:
@@ -22,6 +23,11 @@ Optional env vars:
   OPENWEATHERMAP_API_KEY  — free key from openweathermap.org (1000 calls/day)
   THE_ODDS_API_KEY        — free key from the-odds-api.com (500 requests/month)
   FRED_API_KEY            — free key from fred.stlouisfed.org (unlimited)
+  DISCORD_WEBHOOK_URL     — Discord channel webhook for alerts
+  TELEGRAM_BOT_TOKEN      — Telegram bot token for alerts
+  TELEGRAM_CHAT_ID        — Telegram chat ID for alerts
+  PREDICTIONS_LOG         — path to prediction log (default: predictions.jsonl)
+  PORTFOLIO_FILE          — path to portfolio file (default: portfolio.json)
 """
 
 import json
@@ -66,6 +72,25 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 FINANCE_CACHE_TTL = 300  # 5 min cache for financial data
 ODDS_CACHE_TTL = 300     # 5 min cache for sports odds
+
+# --- CLOB API (real spread verification) ---
+CLOB_API_BASE = "https://clob.polymarket.com"
+CLOB_CACHE_TTL = 30      # 30s cache for order books
+
+# --- Notifications ---
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# --- Prediction logging & portfolio ---
+PREDICTIONS_LOG_FILE = os.environ.get("PREDICTIONS_LOG", "predictions.jsonl")
+PORTFOLIO_FILE = os.environ.get("PORTFOLIO_FILE", "portfolio.json")
+
+# --- CoinGecko rate limiting ---
+COINGECKO_MIN_INTERVAL = 2.0  # min seconds between requests
+
+# --- Historical scans ---
+MAX_SCAN_HISTORY = 10
 
 # Crypto filter — ONLY unambiguous tokens
 # Removed: sol, eth, ada, link, dot, bnb, matic, ltc (too many false positives)
@@ -551,14 +576,22 @@ def _fetch_yahoo_chart(ticker: str) -> dict | None:
                 return data
 
     try:
-        resp = requests.get(
-            f"{YAHOO_CHART_URL}/{ticker}",
-            params={"range": "3mo", "interval": "1d"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-        )
-        resp.raise_for_status()
-        chart = resp.json().get("chart", {}).get("result", [])
+        chart = None
+        for base_url in [YAHOO_CHART_URL,
+                         "https://query2.finance.yahoo.com/v8/finance/chart"]:
+            try:
+                resp = requests.get(
+                    f"{base_url}/{ticker}",
+                    params={"range": "3mo", "interval": "1d"},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=8,
+                )
+                resp.raise_for_status()
+                chart = resp.json().get("chart", {}).get("result", [])
+                if chart:
+                    break
+            except Exception:
+                continue
         if not chart:
             return None
 
@@ -973,14 +1006,22 @@ def _fetch_earnings_data(ticker: str) -> dict | None:
                 return data
 
     try:
-        resp = requests.get(
-            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
-            params={"modules": "earningsTrend,earnings"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-        )
-        resp.raise_for_status()
-        result = resp.json().get("quoteSummary", {}).get("result", [])
+        result = None
+        for base in ["https://query1.finance.yahoo.com",
+                      "https://query2.finance.yahoo.com"]:
+            try:
+                resp = requests.get(
+                    f"{base}/v10/finance/quoteSummary/{ticker}",
+                    params={"modules": "earningsTrend,earnings"},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=8,
+                )
+                resp.raise_for_status()
+                result = resp.json().get("quoteSummary", {}).get("result", [])
+                if result:
+                    break
+            except Exception:
+                continue
         if not result:
             return None
 
@@ -1004,9 +1045,10 @@ def _fetch_earnings_data(ticker: str) -> dict | None:
                     beats += 1
         beat_rate = beats / total if total >= 2 else 0.65  # default 65%
 
-        # Extract current estimate from earningsTrend
+        # Extract current estimate + analyst revisions from earningsTrend
         trend = modules.get("earningsTrend", {}).get("trend", [])
         est_eps = None
+        revision_trend = 0  # positive = upgrades, negative = downgrades
         for t in trend:
             period = t.get("period", "")
             if period in ("0q", "+1q"):
@@ -1014,13 +1056,38 @@ def _fetch_earnings_data(ticker: str) -> dict | None:
                 avg_raw = eps_est.get("avg", {})
                 if isinstance(avg_raw, dict) and avg_raw.get("raw") is not None:
                     est_eps = avg_raw["raw"]
-                    break
+                # Analyst revisions: up vs down in last 7/30 days
+                rev = t.get("epsTrend", {})
+                rev_7d = rev.get("7daysAgo", {})
+                rev_30d = rev.get("30daysAgo", {})
+                cur_raw = rev.get("current", {})
+                cur_est = cur_raw.get("raw") if isinstance(cur_raw, dict) else None
+                r7 = rev_7d.get("raw") if isinstance(rev_7d, dict) else None
+                r30 = rev_30d.get("raw") if isinstance(rev_30d, dict) else None
+                if cur_est is not None:
+                    if r7 is not None and r7 != 0:
+                        revision_trend = (cur_est - r7) / abs(r7)
+                    elif r30 is not None and r30 != 0:
+                        revision_trend = (cur_est - r30) / abs(r30)
+                break
+
+        # Revenue growth from recent quarters
+        rev_growth = None
+        financials = earnings_data.get("financialsChart", {})
+        yearly = financials.get("yearly", [])
+        if len(yearly) >= 2:
+            prev_rev = yearly[-2].get("revenue", {}).get("raw", 0)
+            cur_rev = yearly[-1].get("revenue", {}).get("raw", 0)
+            if prev_rev > 0:
+                rev_growth = (cur_rev - prev_rev) / prev_rev
 
         data = {
             "ticker": ticker,
             "beat_rate": round(beat_rate, 3),
             "est_eps": est_eps,
             "num_quarters": total,
+            "revision_trend": round(revision_trend, 4),
+            "revenue_growth": round(rev_growth, 4) if rev_growth is not None else None,
         }
         with _earnings_lock:
             _earnings_cache[cache_key] = (_time.time(), data)
@@ -1051,6 +1118,8 @@ def analyze_earnings(question: str, end_dt: datetime) -> dict | None:
     beat_rate = data["beat_rate"]
     est_eps = data["est_eps"]
     num_q = data["num_quarters"]
+    revision_trend = data.get("revision_trend", 0)
+    revenue_growth = data.get("revenue_growth")
 
     # Determine direction: beat or miss
     is_miss = bool(_EARNINGS_MISS_RE.search(question))
@@ -1062,6 +1131,28 @@ def analyze_earnings(question: str, end_dt: datetime) -> dict | None:
     else:
         prob = beat_rate
         direction = "beat"
+
+    # Adjust probability based on analyst revision trend
+    # Upward revisions → higher beat probability (analysts still behind)
+    # Downward revisions → lower beat probability (estimates being cut)
+    if revision_trend > 0.02 and direction == "beat":
+        prob = min(prob + 0.05, 0.95)  # slight boost for upward revisions
+    elif revision_trend < -0.02 and direction == "beat":
+        prob = max(prob - 0.05, 0.05)  # slight penalty for downgrades
+    elif revision_trend > 0.02 and direction == "miss":
+        prob = max(prob - 0.05, 0.05)
+    elif revision_trend < -0.02 and direction == "miss":
+        prob = min(prob + 0.05, 0.95)
+
+    # Revenue growth as supporting signal
+    rev_note = ""
+    if revenue_growth is not None:
+        if revenue_growth > 0.10 and direction == "beat":
+            prob = min(prob + 0.03, 0.95)
+            rev_note = f", rev +{revenue_growth*100:.0f}%"
+        elif revenue_growth < -0.05 and direction == "beat":
+            prob = max(prob - 0.03, 0.05)
+            rev_note = f", rev {revenue_growth*100:.0f}%"
 
     # Confidence based on data quality
     if num_q >= 4:
@@ -1080,12 +1171,15 @@ def analyze_earnings(question: str, end_dt: datetime) -> dict | None:
         confidence = "medium"
 
     eps_note = f", EPS est ${est_eps:.2f}" if est_eps is not None else ""
+    rev_trend_note = ""
+    if abs(revision_trend) > 0.01:
+        rev_trend_note = f", revisions {'↑' if revision_trend > 0 else '↓'}{abs(revision_trend)*100:.1f}%"
 
     return {
         "estimated_prob": round(prob, 3),
         "source": "Yahoo Finance Earnings",
         "analysis": (f"{ticker} historical {direction} rate: {beat_rate*100:.0f}% "
-                     f"({num_q}Q data{eps_note}). "
+                     f"({num_q}Q data{eps_note}{rev_trend_note}{rev_note}). "
                      f"P({direction})={prob*100:.0f}%."),
         "confidence": confidence,
         "data_point": f"{beat_rate*100:.0f}% {direction} rate ({num_q}Q)",
@@ -1228,17 +1322,100 @@ def _fetch_fred_series(series_id: str) -> float | None:
         return None
 
 
+def _fetch_fred_trend(series_id: str, limit: int = 12) -> list[float]:
+    """Fetch last N values from FRED for trend analysis."""
+    if not FRED_API_KEY:
+        return []
+    try:
+        resp = requests.get(FRED_API_URL, params={
+            "series_id": series_id,
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": limit,
+        }, timeout=8)
+        resp.raise_for_status()
+        obs = resp.json().get("observations", [])
+        vals = []
+        for o in obs:
+            v = o.get("value", ".")
+            if v != ".":
+                vals.append(float(v))
+        return vals  # most recent first
+    except Exception:
+        return []
+
+
+def _rate_trend_probabilities(current_rate: float | None,
+                              trend: list[float]) -> dict:
+    """Derive hold/cut/hike probabilities from rate trend.
+
+    Instead of static base rates, uses actual rate trajectory.
+    Returns {hold, cut, hike} probabilities summing to 1.0.
+    """
+    if not trend or len(trend) < 2:
+        # Fallback to base rates
+        return {"hold": 0.75, "cut": 0.15, "hike": 0.10}
+
+    # Count recent changes: how many of last N meetings had moves?
+    changes = []
+    for i in range(len(trend) - 1):
+        diff = trend[i] - trend[i + 1]  # trend[0] = most recent
+        if abs(diff) > 0.001:
+            changes.append(diff)
+
+    total_obs = len(trend) - 1
+    n_holds = total_obs - len(changes)
+    hold_rate = n_holds / total_obs if total_obs > 0 else 0.75
+
+    # Determine direction momentum
+    n_cuts = sum(1 for c in changes if c < 0)
+    n_hikes = sum(1 for c in changes if c > 0)
+
+    if len(changes) == 0:
+        # All holds → strong hold probability
+        return {"hold": 0.85, "cut": 0.08, "hike": 0.07}
+
+    # Recent bias: look at last 3 moves
+    recent = changes[:3] if len(changes) >= 3 else changes
+    recent_direction = sum(1 if c < 0 else -1 for c in recent)
+
+    if recent_direction > 0:
+        # Cutting cycle
+        cut_p = min(0.15 + 0.10 * len(recent), 0.50)
+        hold_p = max(hold_rate - 0.05, 0.30)
+        hike_p = max(1.0 - cut_p - hold_p, 0.02)
+    elif recent_direction < 0:
+        # Hiking cycle
+        hike_p = min(0.15 + 0.10 * len(recent), 0.50)
+        hold_p = max(hold_rate - 0.05, 0.30)
+        cut_p = max(1.0 - hike_p - hold_p, 0.02)
+    else:
+        hold_p = max(hold_rate, 0.50)
+        cut_p = (1.0 - hold_p) / 2
+        hike_p = (1.0 - hold_p) / 2
+
+    # Normalize
+    total = hold_p + cut_p + hike_p
+    return {
+        "hold": round(hold_p / total, 3),
+        "cut": round(cut_p / total, 3),
+        "hike": round(hike_p / total, 3),
+    }
+
+
 def analyze_fed_macro(question: str, end_dt: datetime) -> dict | None:
-    """Analyze Fed/macro market using FRED economic data.
+    """Analyze Fed/macro market using FRED economic data + rate trend.
 
     Detects: rate decisions, CPI/inflation, unemployment, GDP markets.
-    Uses FRED API when key available, provides analysis for rate direction markets.
+    Uses FRED API when key available, with trend-based probability model.
     """
     q_lower = question.lower()
 
     # --- Fed rate decision markets ---
     if _FED_RATE_RE.search(question):
         current_rate = _fetch_fred_series("DFEDTARU")
+        rate_trend = _fetch_fred_trend("DFEDTARU", 12)
 
         is_cut = bool(_MACRO_CUT_HIKE_RE.search(question))
         is_hike = bool(_MACRO_HIKE_RE.search(question))
@@ -1248,36 +1425,37 @@ def analyze_fed_macro(question: str, end_dt: datetime) -> dict | None:
         m_thresh = _MACRO_THRESHOLD_RE.search(question)
         threshold = float(m_thresh.group(1)) if m_thresh else None
 
+        # Use trend-based probabilities instead of static base rates
+        trend_probs = _rate_trend_probabilities(current_rate, rate_trend)
+
         if current_rate is not None:
             rate_str = f"{current_rate:.2f}%"
+            trend_note = f" (trend: H={trend_probs['hold']*100:.0f}% C={trend_probs['cut']*100:.0f}% K={trend_probs['hike']*100:.0f}%)"
 
             if threshold is not None:
-                # Threshold-based: "Will rate be above/below X%?"
                 is_below = any(w in q_lower for w in
                                ["below", "under", "lower", "less", "fall"])
                 if is_below:
                     prob = 0.7 if current_rate > threshold else 0.3
                 else:
                     prob = 0.7 if current_rate >= threshold else 0.3
-
                 direction = "below" if is_below else "above"
                 analysis = (f"Fed rate @ {rate_str}, target {direction} "
-                            f"{threshold}%. Market pricing.")
+                            f"{threshold}%.{trend_note}")
             elif is_hold:
-                # "Will Fed hold?" — most meetings result in hold
-                prob = 0.75  # historically ~75% of meetings are holds
-                analysis = f"Fed rate @ {rate_str}. Hold is base case."
+                prob = trend_probs["hold"]
+                analysis = f"Fed rate @ {rate_str}. Trend-based hold P={prob*100:.0f}%.{trend_note}"
             elif is_cut:
-                prob = 0.30  # cuts are rarer events
-                analysis = f"Fed rate @ {rate_str}. Cuts require economic weakness."
+                prob = trend_probs["cut"]
+                analysis = f"Fed rate @ {rate_str}. Trend-based cut P={prob*100:.0f}%.{trend_note}"
             elif is_hike:
-                prob = 0.10  # hikes even rarer in current cycle
-                analysis = f"Fed rate @ {rate_str}. Hikes unlikely in current cycle."
+                prob = trend_probs["hike"]
+                analysis = f"Fed rate @ {rate_str}. Trend-based hike P={prob*100:.0f}%.{trend_note}"
             else:
                 prob = 0.50
-                analysis = f"Fed rate @ {rate_str}. Ambiguous direction."
+                analysis = f"Fed rate @ {rate_str}. Ambiguous direction.{trend_note}"
         else:
-            # No FRED key — provide generic analysis
+            # No FRED key — use static base rates as fallback
             if is_hold:
                 prob = 0.75
             elif is_cut:
@@ -1487,6 +1665,21 @@ def _find_crypto_ticker(question: str) -> str | None:
     return best
 
 
+_cg_last_request_ts = 0.0
+_cg_rate_lock = threading.Lock()
+
+
+def _cg_rate_limit():
+    """Enforce minimum interval between CoinGecko requests."""
+    global _cg_last_request_ts
+    with _cg_rate_lock:
+        now = _time.time()
+        wait = COINGECKO_MIN_INTERVAL - (now - _cg_last_request_ts)
+        if wait > 0:
+            _time.sleep(wait)
+        _cg_last_request_ts = _time.time()
+
+
 def _fetch_crypto_price(coin_id: str) -> dict | None:
     """Fetch current price + 30d change from CoinGecko. Cache 5 min."""
     now_ts = _time.time()
@@ -1502,6 +1695,7 @@ def _fetch_crypto_price(coin_id: str) -> dict | None:
                 return data
 
     try:
+        _cg_rate_limit()
         resp = requests.get(
             f"{COINGECKO_API}/coins/{coin_id}",
             params={
@@ -1824,52 +2018,353 @@ def analyze_elections(question: str, end_dt: datetime) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Analyzer orchestrator
+# Analyzer health tracking
+# ---------------------------------------------------------------------------
+
+_analyzer_health: dict[str, dict] = {}
+_health_lock = threading.Lock()
+
+_ANALYZER_NAMES = [
+    "weather", "finance", "earnings", "sports",
+    "fed_macro", "elections", "crypto",
+]
+
+
+def _record_health(name: str, success: bool, detail: str = ""):
+    with _health_lock:
+        _analyzer_health[name] = {
+            "status": "ok" if success else "error",
+            "last_check": datetime.now(timezone.utc).isoformat(),
+            "detail": detail,
+        }
+
+
+# ---------------------------------------------------------------------------
+# CLOB API — real spread verification
+# ---------------------------------------------------------------------------
+
+_clob_cache: dict[str, tuple[float, dict]] = {}
+_clob_lock = threading.Lock()
+
+
+def _fetch_order_book(token_id: str) -> dict | None:
+    """Fetch order book from Polymarket CLOB."""
+    now_ts = _time.time()
+    with _clob_lock:
+        if token_id in _clob_cache:
+            ts, data = _clob_cache[token_id]
+            if now_ts - ts < CLOB_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(
+            f"{CLOB_API_BASE}/book",
+            params={"token_id": token_id},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        book = resp.json()
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        best_bid = float(bids[0]["price"]) if bids else 0.0
+        best_ask = float(asks[0]["price"]) if asks else 1.0
+        bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
+        ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
+        spread = best_ask - best_bid
+
+        result = {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": round(spread, 4),
+            "spread_pct": round(spread / best_ask * 100, 2) if best_ask > 0 else 0,
+            "bid_depth": round(bid_depth, 2),
+            "ask_depth": round(ask_depth, 2),
+        }
+        with _clob_lock:
+            _clob_cache[token_id] = (_time.time(), result)
+        return result
+    except Exception:
+        return None
+
+
+def verify_arb_execution(market: dict, prices: list[float]) -> dict:
+    """Check CLOB spreads for arb execution feasibility.
+
+    Returns {executable, total_spread_cost_pct, effective_arb_pct, books}.
+    """
+    clob_ids_raw = market.get("clobTokenIds", "[]")
+    try:
+        clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+    except (json.JSONDecodeError, TypeError):
+        return {"executable": None, "total_spread_cost_pct": 0,
+                "effective_arb_pct": 0, "books": []}
+
+    if not clob_ids or not isinstance(clob_ids, list):
+        return {"executable": None, "total_spread_cost_pct": 0,
+                "effective_arb_pct": 0, "books": []}
+
+    books = []
+    total_spread_cost = 0.0
+    for i, tid in enumerate(clob_ids):
+        book = _fetch_order_book(tid)
+        if book:
+            books.append(book)
+            # For arb: we buy at ask price, so spread is the cost
+            total_spread_cost += book["spread"]
+        else:
+            books.append(None)
+
+    arb_deviation = abs(sum(prices) - 1.0)
+    spread_cost_pct = total_spread_cost * 100  # as percentage of $1
+    effective_arb = (arb_deviation * 100) - spread_cost_pct
+
+    return {
+        "executable": effective_arb > 0 if books else None,
+        "total_spread_cost_pct": round(spread_cost_pct, 2),
+        "effective_arb_pct": round(effective_arb, 2),
+        "books": books,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Analyzer orchestrator — multi-analyzer with Bayesian fusion
 # ---------------------------------------------------------------------------
 
 def run_analyzers(question: str, end_dt: datetime) -> dict | None:
-    """Run all available analyzers on a market question.
+    """Run all analyzers, return best result by confidence-weighted edge.
 
-    Returns first positive analysis result or None.
-    Order: weather → finance → earnings → sports → fed/macro → elections → crypto
-    (deterministic, first match wins).
+    If multiple analyzers match, picks the one with highest confidence.
+    Order: weather → finance → earnings → sports → fed/macro → elections → crypto.
     """
-    # Weather (OpenWeatherMap)
-    result = analyze_weather(question, end_dt)
-    if result:
-        return result
+    _analyzers = [
+        ("weather", analyze_weather),
+        ("finance", analyze_finance),
+        ("earnings", analyze_earnings),
+        ("sports", analyze_sports),
+        ("fed_macro", analyze_fed_macro),
+        ("elections", analyze_elections),
+        ("crypto", analyze_crypto),
+    ]
 
-    # Finance (Yahoo Finance — no API key needed)
-    result = analyze_finance(question, end_dt)
-    if result:
-        return result
+    results = []
+    for name, fn in _analyzers:
+        try:
+            r = fn(question, end_dt)
+            if r:
+                _record_health(name, True, r.get("source", ""))
+                results.append((name, r))
+            # Don't record "no match" as error — only actual failures
+        except Exception as exc:
+            _record_health(name, False, str(exc))
 
-    # Earnings (Yahoo Finance — no API key needed)
-    result = analyze_earnings(question, end_dt)
-    if result:
-        return result
+    if not results:
+        return None
 
-    # Sports (The Odds API — optional key)
-    result = analyze_sports(question, end_dt)
-    if result:
-        return result
+    if len(results) == 1:
+        return results[0][1]
 
-    # Fed/Macro (FRED API — optional key, some analysis without key)
-    result = analyze_fed_macro(question, end_dt)
-    if result:
-        return result
+    # Multiple analyzers matched — pick best by confidence then edge magnitude
+    conf_rank = {"high": 3, "medium": 2, "low": 1}
+    results.sort(key=lambda x: (
+        conf_rank.get(x[1].get("confidence", "low"), 0),
+        abs(x[1].get("estimated_prob", 0.5) - 0.5),  # extremity of prediction
+    ), reverse=True)
 
-    # Elections/Polls (RealClearPolitics — no key needed)
-    result = analyze_elections(question, end_dt)
-    if result:
-        return result
+    # Return best, but note all sources in analysis
+    best = results[0][1]
+    if len(results) > 1:
+        other_sources = [r[1].get("source", r[0]) for r in results[1:]]
+        best["also_analyzed_by"] = other_sources
+    return best
 
-    # Crypto (CoinGecko — no key needed, only for crypto price markets)
-    result = analyze_crypto(question, end_dt)
-    if result:
-        return result
 
-    return None
+# ---------------------------------------------------------------------------
+# Kelly Criterion — optimal position sizing
+# ---------------------------------------------------------------------------
+
+def kelly_fraction(win_prob: float, buy_price: float) -> float:
+    """Calculate Kelly criterion fraction for optimal bet sizing.
+
+    Kelly f* = (bp - q) / b
+    where b = net odds (payout/stake - 1), p = win prob, q = 1-p.
+    Returns fraction of bankroll to bet (0 to 1), capped at 25%.
+    """
+    if buy_price <= 0 or buy_price >= 1 or win_prob <= 0 or win_prob >= 1:
+        return 0.0
+    b = (1.0 / buy_price) - 1.0  # net odds
+    q = 1.0 - win_prob
+    f = (b * win_prob - q) / b
+    # Cap at 25% (full Kelly is too aggressive)
+    return max(0.0, min(f, 0.25))
+
+
+# ---------------------------------------------------------------------------
+# Prediction logging — for backtesting
+# ---------------------------------------------------------------------------
+
+_predictions_lock = threading.Lock()
+
+
+def _log_prediction(opp: dict):
+    """Append prediction to JSONL file for future backtesting."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "market_id": opp.get("id", ""),
+        "question": opp.get("question", ""),
+        "tier": opp.get("tier", ""),
+        "score": opp.get("score", 0),
+        "market_state": {
+            "yes_price": opp.get("yes", 0),
+            "no_price": opp.get("no", 0),
+            "price_sum": opp.get("price_sum", 0),
+            "liquidity": opp.get("liquidity", 0),
+            "volume": opp.get("volume", 0),
+        },
+        "trade": {
+            "label": opp.get("trade_label", ""),
+            "side": opp.get("trade_side_class", ""),
+            "ev_per_100": opp.get("ev_per_100", 0),
+            "net_per_100": opp.get("net_per_100", 0),
+            "kelly_pct": opp.get("kelly_pct", 0),
+        },
+    }
+    ea = opp.get("edge_analysis")
+    if ea:
+        entry["edge"] = {
+            "source": ea.get("source", ""),
+            "estimated_prob": ea.get("estimated_prob", 0),
+            "edge": ea.get("edge", 0),
+            "confidence": ea.get("confidence", ""),
+        }
+
+    try:
+        with _predictions_lock:
+            with open(PREDICTIONS_LOG_FILE, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Webhook notifications — Discord / Telegram
+# ---------------------------------------------------------------------------
+
+_last_notified_ids: set[str] = set()
+
+
+def _send_discord_webhook(message: str):
+    """Send notification to Discord webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL,
+                      json={"content": message},
+                      timeout=5)
+    except Exception:
+        pass
+
+
+def _send_telegram_message(message: str):
+    """Send notification via Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message,
+                  "parse_mode": "Markdown"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _notify_new_opportunities(tiers: dict):
+    """Send notifications for new edge/super opportunities."""
+    global _last_notified_ids
+    new_ids = set()
+    messages = []
+
+    for tier_name in ("edge", "super"):
+        for opp in tiers.get(tier_name, []):
+            oid = opp.get("id", "")
+            new_ids.add(oid)
+            if oid and oid not in _last_notified_ids:
+                emoji = "🧠" if tier_name == "edge" else "✅"
+                ev = opp.get("ev_per_100", 0)
+                net = opp.get("net_per_100", 0)
+                msg = (f"{emoji} *{tier_name.upper()}* | "
+                       f"{opp.get('question', '')[:80]}\n"
+                       f"EV: +${ev:.2f}/100 | Net: ${net:.2f} | "
+                       f"Kelly: {opp.get('kelly_pct', 0):.1f}%\n"
+                       f"{opp.get('url', '')}")
+                messages.append(msg)
+
+    for msg in messages[:5]:  # max 5 notifications per scan
+        _send_discord_webhook(msg)
+        _send_telegram_message(msg)
+
+    _last_notified_ids = new_ids
+
+
+# ---------------------------------------------------------------------------
+# Portfolio tracker — local JSON
+# ---------------------------------------------------------------------------
+
+_portfolio_lock = threading.Lock()
+
+
+def _load_portfolio() -> list[dict]:
+    """Load portfolio from JSON file."""
+    try:
+        with open(PORTFOLIO_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_portfolio(portfolio: list[dict]):
+    """Save portfolio to JSON file."""
+    with _portfolio_lock:
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(portfolio, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Historical scan tracking
+# ---------------------------------------------------------------------------
+
+_scan_history: list[dict] = []
+_history_lock = threading.Lock()
+
+
+def _record_scan_history(scan_data: dict):
+    """Keep last N scans for historical comparison."""
+    summary = {
+        "timestamp": scan_data.get("refreshed_at", ""),
+        "total_opps": scan_data.get("total_opps", 0),
+        "tier_counts": {
+            t: len(scan_data.get("tiers", {}).get(t, []))
+            for t in ("edge", "super", "interesting", "watch")
+        },
+        "top_opportunities": [],
+    }
+    # Store top 5 opportunities across all tiers
+    for tier_name in ("edge", "super", "interesting"):
+        for opp in scan_data.get("tiers", {}).get(tier_name, [])[:3]:
+            summary["top_opportunities"].append({
+                "question": opp.get("question", "")[:80],
+                "tier": opp.get("tier", ""),
+                "score": opp.get("score", 0),
+                "ev_per_100": opp.get("ev_per_100", 0),
+            })
+
+    with _history_lock:
+        _scan_history.append(summary)
+        if len(_scan_history) > MAX_SCAN_HISTORY:
+            _scan_history.pop(0)
 
 
 app = Flask(__name__)
@@ -2285,6 +2780,30 @@ def process_market(m: dict, now: datetime) -> dict | None:
             spread_warning = (f"Multi-outcome ({num_outcomes}), "
                               f"~${liq_per_outcome:,.0f}/outcome — slippage probable")
 
+    # --- CLOB spread verification for arbs ---
+    clob_data = None
+    if reason_type == "arbitrage":
+        clob_data = verify_arb_execution(m, float_prices)
+        if clob_data.get("executable") is False:
+            spread_warning = (f"CLOB: spread cost {clob_data['total_spread_cost_pct']:.1f}% "
+                              f"annule l'arb ({clob_data['effective_arb_pct']:.1f}% net)")
+        elif clob_data.get("executable") is True:
+            effective = clob_data["effective_arb_pct"]
+            if effective < 1.0:
+                spread_warning = (f"CLOB: arb net ~{effective:.1f}% après spread — "
+                                  f"marge très faible")
+
+    # --- Kelly criterion ---
+    kelly_pct = 0.0
+    if reason_type == "edge" and edge_analysis:
+        est_prob = edge_analysis.get("estimated_prob", 0)
+        edge_val = edge_analysis.get("edge", 0)
+        win_prob = est_prob if edge_val >= 0 else (1.0 - est_prob)
+        kelly_pct = round(kelly_fraction(win_prob, buy_price) * 100, 1)
+    elif reason_type == "arbitrage" and price_sum > 0:
+        # For arbs, Kelly is effectively 100% (guaranteed) but cap display
+        kelly_pct = 25.0  # max display for guaranteed arbs
+
     # --- Composite score ---
     ext_edge = abs(edge_analysis["edge"]) if edge_analysis else 0.0
     edge_conf = edge_analysis.get("confidence", "high") if edge_analysis else "high"
@@ -2324,6 +2843,8 @@ def process_market(m: dict, now: datetime) -> dict | None:
         "arb_warning": arb_warning,
         "spread_warning": spread_warning,
         "edge_analysis": edge_analysis,
+        "clob_data": clob_data,
+        "kelly_pct": kelly_pct,
         "score": score,
         "category": category,
         "num_outcomes": num_outcomes,
@@ -2375,7 +2896,13 @@ def scan() -> dict:
 
     total_opps = sum(len(v) for v in tiers.values())
 
-    return {
+    # --- Log predictions for backtesting ---
+    for tier_name in ("edge", "super", "interesting"):
+        for opp in tiers[tier_name]:
+            _log_prediction(opp)
+
+    # --- Build result ---
+    result = {
         "error": None,
         "fetched": fetched,
         "qualified": qualified,
@@ -2384,6 +2911,18 @@ def scan() -> dict:
         "categories": sorted(cats),
         "tiers": tiers,
     }
+
+    # --- Record scan history ---
+    _record_scan_history(result)
+
+    # --- Webhook notifications for new edge/super ---
+    _notify_new_opportunities(tiers)
+
+    # --- Analyzer health summary ---
+    with _health_lock:
+        result["analyzer_health"] = dict(_analyzer_health)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2578,6 +3117,14 @@ button{font-family:var(--font);cursor:pointer}
 .trade-ev-pos{font-weight:600;background:var(--pm-green-soft);color:var(--pm-green)}
 .trade-ev-zero{font-weight:500;background:var(--pm-bg-elevated);color:var(--pm-text-tertiary)}
 .trade-warning{width:100%;font-size:10px;color:var(--pm-orange);font-weight:500;margin-top:2px}
+.trade-kelly{font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;background:rgba(46,92,255,.15);color:var(--pm-blue);letter-spacing:.3px}
+.health-bar{display:flex;gap:6px;align-items:center;padding:6px 12px;background:var(--pm-bg-elevated);border-radius:var(--r-xs);margin-bottom:8px;font-size:11px;flex-wrap:wrap}
+.health-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.health-ok{background:var(--pm-green)}
+.health-err{background:var(--pm-red)}
+.health-na{background:var(--pm-text-tertiary)}
+.health-item{display:flex;align-items:center;gap:3px;color:var(--pm-text-secondary)}
+.history-mini{font-size:10px;color:var(--pm-text-tertiary);margin-top:4px}
 .trade-edge{display:inline-block;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:var(--tier-edge-bg);color:var(--tier-edge)}
 .edge-analysis{width:100%;padding:6px 8px;margin-top:4px;border-radius:6px;background:rgba(0,230,118,0.05);border:1px solid rgba(0,230,118,0.15);font-size:11px;color:var(--pm-text-secondary);line-height:1.4}
 .edge-analysis strong{color:var(--tier-edge);font-weight:600}
@@ -2676,6 +3223,7 @@ button{font-family:var(--font);cursor:pointer}
     <strong id="st-qualified">&mdash;</strong> qualified &middot;
     <strong id="st-opps">&mdash;</strong> opportunities
   </div>
+  <div class="health-bar" id="health-bar"></div>
 
   <!-- skeleton -->
   <div id="skeleton">
@@ -2824,6 +3372,11 @@ function renderCard(item){
       +'<span class="trade-ev trade-ev-pos">Net ~$'+item.net_per_100.toFixed(2)+' (frais ~'+item.fee_per_100.toFixed(0)+'%)</span>';
     if(item.arb_warning)tr+='<div class="trade-warning">&#9888; '+esc(item.arb_warning)+'</div>';
     if(item.spread_warning)tr+='<div class="trade-warning">&#9888; '+esc(item.spread_warning)+'</div>';
+    if(item.clob_data&&item.clob_data.executable!==null){
+      var clob=item.clob_data;
+      var cls=clob.executable?'trade-ev-pos':'trade-ev-zero';
+      tr+='<div class="trade-warning" style="color:var(--pm-text-secondary)">CLOB: spread '+clob.total_spread_cost_pct.toFixed(1)+'%, net arb '+clob.effective_arb_pct.toFixed(1)+'%'+(clob.executable?' &#10003;':' &#10007;')+'</div>';
+    }
   }else if(item.reason_type==='edge'&&item.edge_analysis){
     var ea=item.edge_analysis;
     var edgePct=(Math.abs(ea.edge)*100).toFixed(0);
@@ -2835,6 +3388,10 @@ function renderCard(item){
   }else{
     tr+='<span class="trade-speculative">SPECULATIF</span>'
       +'<span class="trade-ev trade-ev-zero">EV ~$0 &middot; Risque -$'+item.risk_per_100.toFixed(0)+'</span>';
+  }
+  /* Kelly sizing */
+  if(item.kelly_pct>0){
+    tr+='<span class="trade-kelly">Kelly: '+item.kelly_pct.toFixed(1)+'%</span>';
   }
 
   /* edge analysis box */
@@ -2909,6 +3466,20 @@ function refresh(){
     document.getElementById('st-qualified').textContent=d.qualified;
     document.getElementById('st-opps').textContent=d.total_opps;
     document.getElementById('topbar-opps').textContent=d.total_opps+' opportunit'+(d.total_opps!==1?'ies':'y');
+
+    /* analyzer health bar */
+    var hb=document.getElementById('health-bar');
+    if(hb&&d.analyzer_health){
+      var hhtml='<span style="color:var(--pm-text-tertiary);font-weight:600">Analyzers:</span>';
+      var names=['weather','finance','earnings','sports','fed_macro','elections','crypto'];
+      var labels={weather:'Meteo',finance:'Finance',earnings:'Earnings',sports:'Sports',fed_macro:'Fed',elections:'Elections',crypto:'Crypto'};
+      names.forEach(function(n){
+        var h=d.analyzer_health[n];
+        var cls=h?((h.status==='ok')?'health-ok':'health-err'):'health-na';
+        hhtml+='<span class="health-item"><span class="health-dot '+cls+'"></span>'+labels[n]+'</span>';
+      });
+      hb.innerHTML=hhtml;
+    }
 
     /* error */
     var ea=document.getElementById('error-area');
@@ -2989,6 +3560,81 @@ def api_scan():
     return jsonify(data)
 
 
+@app.route("/api/health")
+def api_health():
+    """Return analyzer health status."""
+    with _health_lock:
+        health = dict(_analyzer_health)
+    return jsonify({
+        "analyzers": health,
+        "active_count": sum(1 for v in health.values() if v.get("status") == "ok"),
+        "total_count": len(_ANALYZER_NAMES),
+    })
+
+
+@app.route("/api/history")
+def api_history():
+    """Return recent scan history."""
+    with _history_lock:
+        return jsonify(list(_scan_history))
+
+
+@app.route("/api/portfolio", methods=["GET"])
+def api_portfolio_get():
+    """Return current portfolio."""
+    return jsonify(_load_portfolio())
+
+
+@app.route("/api/portfolio", methods=["POST"])
+def api_portfolio_add():
+    """Add position to portfolio."""
+    from flask import request as flask_request
+    data = flask_request.get_json(silent=True)
+    if not data or "market_id" not in data:
+        return jsonify({"error": "market_id required"}), 400
+    portfolio = _load_portfolio()
+    entry = {
+        "market_id": data["market_id"],
+        "question": data.get("question", ""),
+        "side": data.get("side", ""),
+        "price": data.get("price", 0),
+        "amount": data.get("amount", 0),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "open",
+    }
+    portfolio.append(entry)
+    _save_portfolio(portfolio)
+    return jsonify({"ok": True, "count": len(portfolio)})
+
+
+@app.route("/api/portfolio/<market_id>", methods=["DELETE"])
+def api_portfolio_close(market_id):
+    """Close a portfolio position."""
+    portfolio = _load_portfolio()
+    for p in portfolio:
+        if p.get("market_id") == market_id and p.get("status") == "open":
+            p["status"] = "closed"
+            p["closed_at"] = datetime.now(timezone.utc).isoformat()
+    _save_portfolio(portfolio)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/predictions")
+def api_predictions():
+    """Return recent predictions for backtest review."""
+    try:
+        lines = []
+        with open(PREDICTIONS_LOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    lines.append(json.loads(line))
+        # Return last 100
+        return jsonify(lines[-100:])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return jsonify([])
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3059,11 +3705,25 @@ def _validate_api_keys():
         print("  [--] No FRED key (FRED_API_KEY for macro edge)")
     # --- RealClearPolitics ---
     print("  [OK] Elections/Polls — no key needed (RCP + base rates)")
+    # --- CLOB API ---
+    print("  [OK] Polymarket CLOB — no key needed (spread verification)")
+    # --- Notifications ---
+    if DISCORD_WEBHOOK_URL:
+        print(f"  [OK] Discord webhook configured")
+    else:
+        print("  [--] No Discord webhook (DISCORD_WEBHOOK_URL)")
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        print(f"  [OK] Telegram bot configured")
+    else:
+        print("  [--] No Telegram bot (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)")
+    # --- Logging ---
+    print(f"  [OK] Prediction logging → {PREDICTIONS_LOG_FILE}")
+    print(f"  [OK] Portfolio tracking → {PORTFOLIO_FILE}")
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Polymarket Live Opportunity Scanner v5")
+    print("  Polymarket Live Opportunity Scanner v6")
     print("  http://localhost:5000")
     print("=" * 60)
     _validate_api_keys()
