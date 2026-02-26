@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-Polymarket Live Opportunity Scanner v2
+Polymarket Live Opportunity Scanner v3
 =======================================
 Full trading intelligence: ROI, annualized returns, mispricing direction,
 multi-outcome support, category filtering, smart scoring.
 
+NEW in v3: Edge informationnel — weather analyzer detects markets where
+external data (forecasts) disagrees with market prices.
+
 Run:  pip install -r requirements.txt && python polymarket_scanner.py
 Open: http://localhost:5000
+
+Optional env vars:
+  OPENWEATHERMAP_API_KEY  — free key from openweathermap.org (1000 calls/day)
 """
 
 import json
 import math
+import os
 import re
 import threading
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from flask import Flask, jsonify, Response
@@ -37,7 +44,13 @@ MIN_LIQUIDITY = 5000
 CACHE_TTL = 25          # seconds
 MAX_ANN_ROI = 1000.0    # cap annualized ROI to avoid absurd display
 EST_FEE_PCT = 2.0       # estimated round-trip trading fees (%)
+MIN_EDGE = 0.10         # minimum edge (10%) to qualify as "edge" tier
 PORT = 5000
+
+# --- External analysis (optional API keys) ---
+OWM_API_KEY = os.environ.get("OPENWEATHERMAP_API_KEY", "")
+OWM_FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
+OWM_CACHE_TTL = 600     # 10 min cache for weather forecasts
 
 # Crypto filter — ONLY unambiguous tokens
 # Removed: sol, eth, ada, link, dot, bnb, matic, ltc (too many false positives)
@@ -52,6 +65,241 @@ CRYPTO_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Weather Analyzer — external edge detection
+# ---------------------------------------------------------------------------
+
+# Map city names / aliases → (lat, lon) for common Polymarket weather markets
+CITY_COORDS: dict[str, tuple[float, float]] = {
+    "new york": (40.71, -74.01), "nyc": (40.71, -74.01), "manhattan": (40.71, -74.01),
+    "los angeles": (34.05, -118.24), "la": (34.05, -118.24),
+    "chicago": (41.88, -87.63), "houston": (29.76, -95.37),
+    "phoenix": (33.45, -112.07), "philadelphia": (39.95, -75.17),
+    "san antonio": (29.42, -98.49), "san diego": (32.72, -117.16),
+    "dallas": (32.78, -96.80), "austin": (30.27, -97.74),
+    "miami": (25.76, -80.19), "atlanta": (33.75, -84.39),
+    "boston": (42.36, -71.06), "seattle": (47.61, -122.33),
+    "denver": (39.74, -104.99), "nashville": (36.16, -86.78),
+    "washington": (38.91, -77.04), "dc": (38.91, -77.04),
+    "san francisco": (37.77, -122.42), "sf": (37.77, -122.42),
+    "las vegas": (36.17, -115.14), "portland": (45.51, -122.68),
+    "detroit": (42.33, -83.05), "minneapolis": (44.98, -93.27),
+    "london": (51.51, -0.13), "paris": (48.86, 2.35), "tokyo": (35.68, 139.69),
+    "toronto": (43.65, -79.38), "sydney": (-33.87, 151.21),
+}
+
+# Regex to parse weather market questions
+_WEATHER_TEMP_RE = re.compile(
+    r"(?:temperature|high|low|temp).*?"
+    r"(?:in|at|for)\s+"
+    r"(?P<city>[A-Z][\w\s]{2,25}?)"
+    r".*?(?:above|over|exceed|reach|below|under|at least|hit)\s*"
+    r"(?P<threshold>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>[°]?\s*[FCfc]|fahrenheit|celsius)?",
+    re.IGNORECASE,
+)
+
+_WEATHER_RAIN_RE = re.compile(
+    r"(?:rain|precipitation|snow|storm)"
+    r".*?(?:in|at|for)\s+"
+    r"(?P<city>[A-Z][\w\s]{2,25}?)"
+    r"(?:.*?(?:on|by|before)\s+(?P<date>\w+\s+\d+|\w+day))?",
+    re.IGNORECASE,
+)
+
+_WEATHER_GENERAL_RE = re.compile(
+    r"(?:weather|temperature|rain|snow|precipitation|high|heat|cold|freeze|frost)"
+    r".*?(?:in|at|for)\s+"
+    r"(?P<city>[A-Z][\w\s]{2,25})",
+    re.IGNORECASE,
+)
+
+_owm_cache: dict[str, tuple[float, object]] = {}
+_owm_lock = threading.Lock()
+
+
+def _fetch_owm_forecast(lat: float, lon: float) -> list[dict] | None:
+    """Fetch 5-day/3h forecast from OpenWeatherMap. Returns list of entries or None."""
+    if not OWM_API_KEY:
+        return None
+    cache_key = f"{lat:.2f},{lon:.2f}"
+    with _owm_lock:
+        if cache_key in _owm_cache:
+            ts, data = _owm_cache[cache_key]
+            if _time.time() - ts < OWM_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(OWM_FORECAST_URL, params={
+            "lat": lat, "lon": lon, "appid": OWM_API_KEY,
+            "units": "imperial",  # Fahrenheit — Polymarket is US-centric
+        }, timeout=5)
+        resp.raise_for_status()
+        entries = resp.json().get("list", [])
+        with _owm_lock:
+            _owm_cache[cache_key] = (_time.time(), entries)
+        return entries
+    except Exception:
+        return None
+
+
+def _find_city(text: str) -> tuple[str, float, float] | None:
+    """Extract city name from text and return (name, lat, lon) or None."""
+    text_lower = text.lower()
+    # Direct match in known cities (longest match first)
+    best = None
+    for city_name, (lat, lon) in CITY_COORDS.items():
+        if city_name in text_lower:
+            if best is None or len(city_name) > len(best[0]):
+                best = (city_name, lat, lon)
+    return best
+
+
+def _to_fahrenheit(val: float, unit: str | None) -> float:
+    """Convert to Fahrenheit if unit looks like Celsius."""
+    if unit and unit.strip().lower() in ("c", "celsius", "°c"):
+        return val * 9 / 5 + 32
+    return val  # default: already Fahrenheit
+
+
+def analyze_weather(question: str, end_dt: datetime) -> dict | None:
+    """Analyze a weather market question against OWM forecast data.
+
+    Returns dict with analysis results or None if not a weather market
+    or analysis not possible.
+
+    Return keys:
+        estimated_prob (float 0-1): our probability estimate
+        source (str): "OpenWeatherMap"
+        analysis (str): human-readable explanation
+        confidence (str): "high" / "medium" / "low"
+        data_point (str): the key data value used
+    """
+    if not OWM_API_KEY:
+        return None
+
+    # --- Try temperature pattern ---
+    m_temp = _WEATHER_TEMP_RE.search(question)
+    if m_temp:
+        city_text = m_temp.group("city").strip()
+        threshold = float(m_temp.group("threshold"))
+        unit = m_temp.group("unit")
+        threshold_f = _to_fahrenheit(threshold, unit)
+
+        city_info = _find_city(city_text) or _find_city(question)
+        if not city_info:
+            return None
+        city_name, lat, lon = city_info
+
+        entries = _fetch_owm_forecast(lat, lon)
+        if not entries:
+            return None
+
+        # Filter entries up to market end date
+        relevant = []
+        for e in entries:
+            dt_unix = e.get("dt", 0)
+            entry_dt = datetime.fromtimestamp(dt_unix, tz=timezone.utc)
+            if entry_dt <= end_dt:
+                relevant.append(e)
+        if not relevant:
+            return None
+
+        # Check high temperatures
+        is_above = any(w in question.lower() for w in ["above", "over", "exceed", "reach", "hit", "at least"])
+        highs = [e.get("main", {}).get("temp_max", 0) for e in relevant]
+        max_high = max(highs) if highs else 0
+
+        if is_above:
+            above_count = sum(1 for h in highs if h >= threshold_f)
+            prob = above_count / len(highs) if highs else 0
+            # Boost if max is well above threshold
+            if max_high >= threshold_f + 5:
+                prob = min(prob + 0.15, 1.0)
+            direction = "above"
+        else:
+            below_count = sum(1 for h in highs if h < threshold_f)
+            prob = below_count / len(highs) if highs else 0
+            if max_high < threshold_f - 5:
+                prob = min(prob + 0.15, 1.0)
+            direction = "below"
+
+        confidence = "high" if len(relevant) >= 8 else "medium" if len(relevant) >= 3 else "low"
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "OpenWeatherMap",
+            "analysis": f"Forecast: max {max_high:.0f}°F for {city_name.title()} "
+                        f"({len(relevant)} data points). Threshold: {direction} {threshold_f:.0f}°F.",
+            "confidence": confidence,
+            "data_point": f"{max_high:.0f}°F max forecast",
+        }
+
+    # --- Try rain/precipitation pattern ---
+    m_rain = _WEATHER_RAIN_RE.search(question)
+    if m_rain:
+        city_text = m_rain.group("city").strip()
+        city_info = _find_city(city_text) or _find_city(question)
+        if not city_info:
+            return None
+        city_name, lat, lon = city_info
+
+        entries = _fetch_owm_forecast(lat, lon)
+        if not entries:
+            return None
+
+        relevant = []
+        for e in entries:
+            dt_unix = e.get("dt", 0)
+            entry_dt = datetime.fromtimestamp(dt_unix, tz=timezone.utc)
+            if entry_dt <= end_dt:
+                relevant.append(e)
+        if not relevant:
+            return None
+
+        # Check precipitation probability
+        pop_values = [e.get("pop", 0) for e in relevant]
+        max_pop = max(pop_values) if pop_values else 0
+        avg_pop = sum(pop_values) / len(pop_values) if pop_values else 0
+
+        # "Will it rain?" → prob = max chance of precipitation in the window
+        is_snow = "snow" in question.lower()
+        precip_type = "snow" if is_snow else "rain"
+
+        # Use max PoP as probability (any rain in window)
+        prob = max_pop
+        confidence = "high" if len(relevant) >= 8 else "medium" if len(relevant) >= 3 else "low"
+
+        return {
+            "estimated_prob": round(prob, 3),
+            "source": "OpenWeatherMap",
+            "analysis": f"Forecast: {precip_type} prob max {max_pop*100:.0f}% / avg {avg_pop*100:.0f}% "
+                        f"for {city_name.title()} ({len(relevant)} data points).",
+            "confidence": confidence,
+            "data_point": f"{max_pop*100:.0f}% max PoP",
+        }
+
+    return None
+
+
+def run_analyzers(question: str, end_dt: datetime) -> dict | None:
+    """Run all available analyzers on a market question.
+
+    Returns best analysis result or None.
+    Future: add sports odds, finance, etc. here.
+    """
+    # Weather
+    result = analyze_weather(question, end_dt)
+    if result:
+        return result
+
+    # Future analyzers go here:
+    # result = analyze_sports(question, end_dt)
+    # result = analyze_finance(question, end_dt)
+
+    return None
+
 
 app = Flask(__name__)
 
@@ -164,10 +412,12 @@ def extract_category(m: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def classify(max_price: float, deviation: float,
-             price_sum: float) -> tuple[str | None, str, str]:
+             price_sum: float,
+             edge_analysis: dict | None = None) -> tuple[str | None, str, str]:
     """Classify opportunity: (tier, reason_label, reason_type) or (None,'','').
 
     Philosophy: only REAL edge, no luck.
+    - edge (external data diverges from market) → top priority if edge > MIN_EDGE
     - arbitrage (sum < 1.0, >2%) = guaranteed profit → super/interesting
     - near_certain (>90%) = EV ≈ $0, involves luck → watch only
     - overround (sum > 1.0) = excluded (margin against you)
@@ -175,6 +425,11 @@ def classify(max_price: float, deviation: float,
     """
     if max_price > 0.995:
         return (None, "", "")  # Too certain — negligible profit
+
+    # --- External edge (data-driven) — REAL informational advantage ---
+    if edge_analysis and abs(edge_analysis.get("edge", 0)) >= MIN_EDGE:
+        source = edge_analysis.get("source", "Analyse")
+        return ("edge", f"Edge {source}", "edge")
 
     # --- Guaranteed arbitrage (sum < 1.0, min 2% to cover fees) ---
     if price_sum < 1.0 and deviation > 0.04:
@@ -190,9 +445,12 @@ def classify(max_price: float, deviation: float,
 
 
 def compute_score(deviation: float, price_sum: float, max_price: float,
-                  days_left: float, liquidity: float) -> float:
-    """Score by attractiveness. Arbs (real edge) >> near-certain (no edge)."""
-    if price_sum < 1.0 and deviation > 0.02:
+                  days_left: float, liquidity: float,
+                  ext_edge: float = 0.0) -> float:
+    """Score by attractiveness. Edge > arbs >> near-certain."""
+    if ext_edge >= MIN_EDGE:
+        edge = ext_edge * 40           # external edge: very high weight
+    elif price_sum < 1.0 and deviation > 0.02:
         edge = deviation * 50          # arb: dominant weight
     else:
         edge = max(max_price - 0.70, 0) * 0.1  # near-certain: minimal weight
@@ -282,8 +540,20 @@ def process_market(m: dict, now: datetime) -> dict | None:
         yes_label = truncate(max_outcome_name, 14)
         no_label = f"Others ({num_outcomes - 1})"
 
+    # --- External analysis (weather, sports, etc.) ---
+    edge_analysis = None
+    analysis_result = run_analyzers(question, end_dt)
+    if analysis_result:
+        est_prob = analysis_result["estimated_prob"]
+        # Edge = how much our estimate disagrees with market (for "Yes" outcome)
+        # Positive edge = market underprices the likely outcome
+        raw_edge = est_prob - max_price
+        analysis_result["edge"] = round(raw_edge, 4)
+        analysis_result["market_price"] = max_price
+        edge_analysis = analysis_result
+
     # --- Classify ---
-    tier, reason_label, reason_type = classify(max_price, deviation, price_sum)
+    tier, reason_label, reason_type = classify(max_price, deviation, price_sum, edge_analysis)
     if tier is None:
         return None
 
@@ -304,6 +574,27 @@ def process_market(m: dict, now: datetime) -> dict | None:
         trade_side_class = "arb"
         buy_price = price_sum
         is_guaranteed = True
+    elif reason_type == "edge":
+        edge_val = edge_analysis["edge"] if edge_analysis else 0
+        if edge_val >= 0:
+            trade_label = f"BUY {truncate(max_outcome_name.upper(), 12)} @ {int(max_price * 100)}\u00a2"
+            trade_side_class = "yes" if (max_idx == 0 or not is_binary) else "no"
+            buy_price = max_price
+        else:
+            # Negative edge = market overprices Yes, so buy No / cheapest
+            if is_binary:
+                other_idx = 1 - max_idx
+                other_name = outcomes[other_idx] if other_idx < len(outcomes) else "No"
+                other_price = float_prices[other_idx]
+            else:
+                other_idx = min((i for i in range(num_outcomes) if i != max_idx),
+                                key=lambda i: float_prices[i])
+                other_name = outcomes[other_idx] if other_idx < len(outcomes) else f"Out.{other_idx+1}"
+                other_price = float_prices[other_idx]
+            trade_label = f"BUY {truncate(other_name.upper(), 12)} @ {int(other_price * 100)}\u00a2"
+            trade_side_class = "no" if is_binary else "yes"
+            buy_price = other_price
+        is_guaranteed = False
     else:
         trade_label = f"BUY {truncate(max_outcome_name.upper(), 12)} @ {int(max_price * 100)}\u00a2"
         trade_side_class = "yes" if (max_idx == 0 or not is_binary) else "no"
@@ -321,6 +612,13 @@ def process_market(m: dict, now: datetime) -> dict | None:
         fee_per_100 = round(EST_FEE_PCT, 2)
         net_per_100 = round(ev_per_100 - fee_per_100, 2)
         arb_warning = f"{num_outcomes} trades requis"
+    elif reason_type == "edge" and edge_analysis:
+        edge_abs = abs(edge_analysis["edge"])
+        ev_per_100 = round(edge_abs * 100, 2)  # expected gain per $100
+        risk_per_100 = 100.0  # you can still lose
+        fee_per_100 = round(EST_FEE_PCT, 2)
+        net_per_100 = round(ev_per_100 - fee_per_100, 2)
+        arb_warning = ""
     else:
         ev_per_100 = 0.0
         risk_per_100 = 100.0
@@ -333,7 +631,8 @@ def process_market(m: dict, now: datetime) -> dict | None:
     thin = liquidity < 10000 or vol_liq > 20
 
     # --- Composite score ---
-    score = compute_score(deviation, price_sum, max_price, days_left, liquidity)
+    ext_edge = abs(edge_analysis["edge"]) if edge_analysis else 0.0
+    score = compute_score(deviation, price_sum, max_price, days_left, liquidity, ext_edge)
 
     return {
         "tier": tier,
@@ -366,6 +665,7 @@ def process_market(m: dict, now: datetime) -> dict | None:
         "fee_per_100": fee_per_100,
         "net_per_100": net_per_100,
         "arb_warning": arb_warning,
+        "edge_analysis": edge_analysis,
         "score": score,
         "category": category,
         "num_outcomes": num_outcomes,
@@ -388,11 +688,11 @@ def scan() -> dict:
             "qualified": 0,
             "refreshed_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
             "categories": [],
-            "tiers": {"super": [], "interesting": [], "watch": []},
+            "tiers": {"edge": [], "super": [], "interesting": [], "watch": []},
         }
 
     fetched = len(raw)
-    tiers: dict[str, list] = {"super": [], "interesting": [], "watch": []}
+    tiers: dict[str, list] = {"edge": [], "super": [], "interesting": [], "watch": []}
     cats: set[str] = set()
     seen: set[str] = set()
     qualified = 0
@@ -476,6 +776,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   --tier-super-bg:    rgba(255,147,50,0.08);
   --tier-int:         #9b6dff;
   --tier-int-bg:      rgba(155,109,255,0.06);
+  --tier-edge:        #00e676;
+  --tier-edge-bg:     rgba(0,230,118,0.08);
   --tier-watch:       #3dc2ec;
   --tier-watch-bg:    rgba(61,194,236,0.05);
   --r-xs: 4px; --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-full: 100px;
@@ -555,6 +857,7 @@ button{font-family:var(--font);cursor:pointer}
 .tier-icon{font-size:18px;line-height:1}
 .tier-label{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.6px}
 .tier-count{font-size:11px;font-weight:600;padding:2px 8px;border-radius:var(--r-full);line-height:1.5}
+.tier-edge .tier-label{color:var(--tier-edge)}.tier-edge .tier-count{background:var(--tier-edge-bg);color:var(--tier-edge)}
 .tier-super .tier-label{color:var(--tier-super)}.tier-super .tier-count{background:var(--tier-super-bg);color:var(--tier-super)}
 .tier-int .tier-label{color:var(--tier-int)}.tier-int .tier-count{background:var(--tier-int-bg);color:var(--tier-int)}
 .tier-watch .tier-label{color:var(--tier-watch)}.tier-watch .tier-count{background:var(--tier-watch-bg);color:var(--tier-watch)}
@@ -572,6 +875,7 @@ button{font-family:var(--font);cursor:pointer}
 .market-card{background:var(--pm-bg-card);border:1px solid var(--pm-border);border-radius:var(--r-lg);padding:14px 14px 12px;transition:border-color .15s,background .15s;display:flex;flex-direction:column;gap:10px;position:relative;overflow:hidden}
 .market-card:hover{border-color:var(--pm-border-light);background:var(--pm-bg-card-hover)}
 .market-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.tier-edge .market-card::before{background:var(--tier-edge)}
 .tier-super .market-card::before{background:var(--tier-super)}
 .tier-int .market-card::before{background:var(--tier-int)}
 .tier-watch .market-card::before{background:var(--tier-watch)}
@@ -616,6 +920,13 @@ button{font-family:var(--font);cursor:pointer}
 .trade-ev-pos{font-weight:600;background:var(--pm-green-soft);color:var(--pm-green)}
 .trade-ev-zero{font-weight:500;background:var(--pm-bg-elevated);color:var(--pm-text-tertiary)}
 .trade-warning{width:100%;font-size:10px;color:var(--pm-orange);font-weight:500;margin-top:2px}
+.trade-edge{display:inline-block;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:var(--tier-edge-bg);color:var(--tier-edge)}
+.edge-analysis{width:100%;padding:6px 8px;margin-top:4px;border-radius:6px;background:rgba(0,230,118,0.05);border:1px solid rgba(0,230,118,0.15);font-size:11px;color:var(--pm-text-secondary);line-height:1.4}
+.edge-analysis strong{color:var(--tier-edge);font-weight:600}
+.edge-confidence{display:inline-block;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px}
+.edge-confidence.high{background:rgba(0,230,118,0.15);color:var(--tier-edge)}
+.edge-confidence.medium{background:rgba(255,147,50,0.15);color:var(--pm-orange)}
+.edge-confidence.low{background:rgba(255,100,100,0.15);color:var(--pm-red)}
 
 /* footer */
 .card-footer{display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap}
@@ -626,6 +937,7 @@ button{font-family:var(--font);cursor:pointer}
 .card-tags{display:flex;gap:4px;flex-wrap:wrap}
 .category-tag{font-size:10px;font-weight:600;padding:2px 7px;border-radius:var(--r-full);background:var(--pm-bg-elevated);color:var(--pm-text-secondary)}
 .reason-tag{font-size:10px;font-weight:600;padding:2px 7px;border-radius:var(--r-full);white-space:nowrap}
+.tier-edge .reason-tag{background:var(--tier-edge-bg);color:var(--tier-edge)}
 .tier-super .reason-tag{background:var(--tier-super-bg);color:var(--tier-super)}
 .tier-int .reason-tag{background:var(--tier-int-bg);color:var(--tier-int)}
 .tier-watch .reason-tag{background:var(--tier-watch-bg);color:var(--tier-watch)}
@@ -718,6 +1030,14 @@ button{font-family:var(--font);cursor:pointer}
 
   <!-- content -->
   <div id="content" style="display:none">
+    <div class="tier-section tier-edge" id="sec-edge">
+      <div class="tier-header">
+        <span class="tier-icon">&#129504;</span>
+        <span class="tier-label">Edge Informationnel</span>
+        <span class="tier-count" id="cnt-edge">0</span>
+      </div>
+      <div class="card-grid" id="tier-edge"></div>
+    </div>
     <div class="tier-section tier-super" id="sec-super">
       <div class="tier-header">
         <span class="tier-icon">&#9989;</span>
@@ -809,7 +1129,7 @@ function filterCat(cat){
   document.querySelectorAll('.market-card').forEach(function(c){
     c.style.display=(cat==='all'||c.dataset.category===cat)?'':'none';
   });
-  ['super','int','watch'].forEach(function(t){
+  ['edge','super','int','watch'].forEach(function(t){
     var g=document.getElementById('tier-'+t);
     var cards=g.querySelectorAll('.market-card');
     var vis=0;cards.forEach(function(c){if(c.style.display!=='none')vis++});
@@ -845,9 +1165,29 @@ function renderCard(item){
       +'<span class="trade-guaranteed">GARANTI</span>'
       +'<span class="trade-ev trade-ev-pos">Net ~$'+item.net_per_100.toFixed(2)+' (frais ~'+item.fee_per_100.toFixed(0)+'%)</span>';
     if(item.arb_warning)tr+='<div class="trade-warning">&#9888; '+esc(item.arb_warning)+'</div>';
+  }else if(item.reason_type==='edge'&&item.edge_analysis){
+    var ea=item.edge_analysis;
+    var edgePct=(Math.abs(ea.edge)*100).toFixed(0);
+    tr+='<span class="trade-edge">EDGE +'+edgePct+'%</span>'
+      +'<span class="trade-profit">EV +$'+item.ev_per_100.toFixed(2)+'</span>'
+      +'<span class="trade-per">/ $100</span>'
+      +'<span class="trade-ann">'+(item.ann_roi_capped?'&ge;':'')+fmtRoi(item.ann_roi)+' ann.</span>';
   }else{
     tr+='<span class="trade-speculative">SPECULATIF</span>'
       +'<span class="trade-ev trade-ev-zero">EV ~$0 &middot; Risque -$'+item.risk_per_100.toFixed(0)+'</span>';
+  }
+
+  /* edge analysis box */
+  var eaHtml='';
+  if(item.edge_analysis){
+    var ea=item.edge_analysis;
+    var confCls=ea.confidence||'medium';
+    eaHtml='<div class="edge-analysis">'
+      +'<strong>'+esc(ea.source)+'</strong>: '+esc(ea.analysis)
+      +'<br>Estimation: <strong>'+(ea.estimated_prob*100).toFixed(0)+'%</strong>'
+      +' vs march\u00e9 <strong>'+(ea.market_price*100).toFixed(0)+'%</strong>'
+      +'<span class="edge-confidence '+confCls+'">'+confCls+'</span>'
+      +'</div>';
   }
 
   /* stats */
@@ -869,6 +1209,7 @@ function renderCard(item){
     +'</div>'
     +'<div class="prob-bar"><div class="prob-bar-fill" style="width:'+yP+'%"></div></div>'
     +'<div class="card-trade">'+tr+'</div>'
+    +eaHtml
     +'<div class="card-footer"><div class="card-stats">'+st+'</div><div class="card-tags">'+tg+'</div></div>'
     +'</div>';
 }
@@ -920,17 +1261,18 @@ function refresh(){
     /* mark NEW */
     var curIds=new Set();
     var hasNewSuper=false;
-    ['super','interesting','watch'].forEach(function(t){
+    ['edge','super','interesting','watch'].forEach(function(t){
       (d.tiers[t]||[]).forEach(function(item){
         curIds.add(item.id);
         item.is_new=(previousIds.size>0&&!previousIds.has(item.id));
-        if(item.is_new&&t==='super')hasNewSuper=true;
+        if(item.is_new&&(t==='super'||t==='edge'))hasNewSuper=true;
       });
     });
     previousIds=curIds;
     if(hasNewSuper)playAlert();
 
     /* render */
+    renderTier('tier-edge','cnt-edge',d.tiers.edge||[]);
     renderTier('tier-super','cnt-super',d.tiers['super']);
     renderTier('tier-int','cnt-int',d.tiers.interesting);
     renderTier('tier-watch','cnt-watch',d.tiers.watch);

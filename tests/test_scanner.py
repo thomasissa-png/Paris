@@ -15,10 +15,17 @@ import math
 import pytest
 from datetime import datetime, timezone, timedelta
 
+from unittest.mock import patch
+
 from polymarket_scanner import (
+    CITY_COORDS,
     EST_FEE_PCT,
     MAX_ANN_ROI,
+    MIN_EDGE,
     MIN_LIQUIDITY,
+    _find_city,
+    _to_fahrenheit,
+    analyze_weather,
     classify,
     compute_score,
     extract_category,
@@ -26,6 +33,7 @@ from polymarket_scanner import (
     parse_date,
     parse_float,
     process_market,
+    run_analyzers,
     truncate,
 )
 
@@ -674,7 +682,7 @@ class TestProcessMarket:
         assert r_arb["score"] > r_nc["score"] * 10
 
     def test_all_new_fields_present(self, now):
-        """All results must have fee, net, warning fields."""
+        """All results must have fee, net, warning, edge_analysis fields."""
         m = _make_market(now)
         result = process_market(m, now)
         assert result is not None
@@ -684,3 +692,239 @@ class TestProcessMarket:
         assert "net_per_100" in result
         assert "arb_warning" in result
         assert "ann_roi_capped" in result
+        assert "edge_analysis" in result
+
+    def test_edge_analysis_none_without_api_key(self, now):
+        """Without OWM key, edge_analysis should be None for any market."""
+        m = _make_market(now, question="Will temperature in New York exceed 80F?")
+        result = process_market(m, now)
+        assert result is not None
+        assert result["edge_analysis"] is None
+
+
+# =========================================================================
+# Weather Analyzer — city detection, unit conversion, question parsing
+# =========================================================================
+
+class TestFindCity:
+    """Test city name extraction from question text."""
+
+    def test_find_nyc(self):
+        result = _find_city("temperature in New York above 80F")
+        assert result is not None
+        assert result[0] == "new york"
+
+    def test_find_nyc_alias(self):
+        result = _find_city("Will the high in NYC exceed 75?")
+        assert result is not None
+        assert result[0] == "nyc"
+
+    def test_find_chicago(self):
+        result = _find_city("Rain in Chicago on Tuesday?")
+        assert result is not None
+        assert result[0] == "chicago"
+
+    def test_find_london(self):
+        result = _find_city("Temperature in London above 20C")
+        assert result is not None
+        assert result[0] == "london"
+
+    def test_longest_match_wins(self):
+        """'san francisco' should match over 'san'."""
+        result = _find_city("Weather in San Francisco this week")
+        assert result is not None
+        assert result[0] == "san francisco"
+
+    def test_no_match(self):
+        result = _find_city("Will the bill pass the Senate?")
+        assert result is None
+
+    def test_case_insensitive(self):
+        result = _find_city("temp in MIAMI above 90")
+        assert result is not None
+        assert result[0] == "miami"
+
+
+class TestToFahrenheit:
+    def test_fahrenheit_passthrough(self):
+        assert _to_fahrenheit(80, "F") == 80
+
+    def test_celsius_conversion(self):
+        assert _to_fahrenheit(0, "C") == 32
+        assert abs(_to_fahrenheit(100, "celsius") - 212) < 0.01
+
+    def test_no_unit_defaults_fahrenheit(self):
+        assert _to_fahrenheit(75, None) == 75
+
+    def test_degree_c(self):
+        assert abs(_to_fahrenheit(20, "°C") - 68) < 0.01
+
+
+class TestAnalyzeWeather:
+    """Test weather analysis with mocked OWM API responses."""
+
+    def _make_owm_entries(self, temps, pops=None, base_dt=None):
+        """Create mock OWM forecast entries."""
+        if base_dt is None:
+            base_dt = datetime.now(timezone.utc)
+        entries = []
+        for i, temp in enumerate(temps):
+            entry = {
+                "dt": int((base_dt + timedelta(hours=3 * i)).timestamp()),
+                "main": {"temp": temp, "temp_max": temp + 2, "temp_min": temp - 2},
+                "pop": pops[i] if pops else 0.0,
+            }
+            entries.append(entry)
+        return entries
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_temp_above_detected(self, mock_fetch):
+        """Temperature market: forecast 85°F, threshold 80°F → high prob."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = self._make_owm_entries([82, 85, 78, 84, 80, 86, 79, 83])
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will the high temperature in New York exceed 80F by Friday?",
+            end_dt,
+        )
+        assert result is not None
+        assert result["source"] == "OpenWeatherMap"
+        assert result["estimated_prob"] > 0.5
+        assert result["confidence"] == "high"
+        assert "80" in result["analysis"]
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_temp_below_threshold(self, mock_fetch):
+        """Forecast well below threshold → low prob."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = self._make_owm_entries([60, 62, 58, 61, 59, 63, 57, 60])
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will the temperature in Chicago reach 80F?",
+            end_dt,
+        )
+        assert result is not None
+        assert result["estimated_prob"] < 0.2
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_rain_detected(self, mock_fetch):
+        """Rain question with high PoP → high prob."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = self._make_owm_entries(
+            [70] * 8,
+            pops=[0.1, 0.3, 0.8, 0.9, 0.7, 0.4, 0.2, 0.1],
+        )
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will it rain in Miami this week?",
+            end_dt,
+        )
+        assert result is not None
+        assert result["estimated_prob"] >= 0.8
+        assert "rain" in result["analysis"].lower()
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_rain_low_pop(self, mock_fetch):
+        """Dry forecast → low prob."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = self._make_owm_entries(
+            [70] * 8,
+            pops=[0.05, 0.0, 0.1, 0.0, 0.05, 0.0, 0.0, 0.02],
+        )
+        mock_fetch.return_value = entries
+
+        result = analyze_weather("Will it rain in Denver?", end_dt)
+        assert result is not None
+        assert result["estimated_prob"] < 0.2
+
+    def test_no_api_key_returns_none(self):
+        """Without API key, analyze_weather returns None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        result = analyze_weather(
+            "Will temperature in New York exceed 80F?",
+            end_dt,
+        )
+        assert result is None
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    def test_non_weather_question_returns_none(self):
+        """Non-weather question → None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        result = analyze_weather("Will Trump win the election?", end_dt)
+        assert result is None
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    def test_unknown_city_returns_none(self):
+        """Weather question with unknown city → None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        result = analyze_weather(
+            "Will temperature in Timbuktu exceed 120F?",
+            end_dt,
+        )
+        assert result is None
+
+
+# =========================================================================
+# classify() with edge_analysis
+# =========================================================================
+
+class TestClassifyEdge:
+    """Test that edge_analysis triggers the 'edge' tier."""
+
+    def test_edge_above_min_edge(self):
+        """Edge >= MIN_EDGE → edge tier."""
+        ea = {"edge": 0.15, "source": "OpenWeatherMap"}
+        tier, label, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
+        assert "OpenWeatherMap" in label
+
+    def test_edge_below_min_edge(self):
+        """Edge < MIN_EDGE → falls through to normal classify."""
+        ea = {"edge": 0.05, "source": "OpenWeatherMap"}
+        tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier is None  # 70% = not near_certain, not arb
+
+    def test_edge_negative_large(self):
+        """Negative edge (market overprices) → still triggers if abs >= MIN_EDGE."""
+        ea = {"edge": -0.20, "source": "OpenWeatherMap"}
+        tier, _, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
+
+    def test_edge_none_no_effect(self):
+        """No edge_analysis → normal behavior."""
+        tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=None)
+        assert tier is None
+
+    def test_edge_still_filters_too_certain(self):
+        """0.996 is filtered even with edge analysis."""
+        ea = {"edge": 0.20, "source": "Test"}
+        tier, _, _ = classify(0.996, 0.0, 1.0, edge_analysis=ea)
+        assert tier is None
+
+
+# =========================================================================
+# compute_score() with ext_edge
+# =========================================================================
+
+class TestComputeScoreEdge:
+
+    def test_edge_scores_higher_than_near_certain(self):
+        s_edge = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20)
+        s_nc = compute_score(0.0, 1.0, 0.94, 5, 50000, ext_edge=0.0)
+        assert s_edge > s_nc * 5
+
+    def test_edge_scores_comparable_to_arbs(self):
+        s_edge = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20)
+        s_arb = compute_score(0.05, 0.95, 0.50, 5, 50000, ext_edge=0.0)
+        # Both should be in similar range (edge is real edge too)
+        assert s_edge > 0
+        assert s_arb > 0
