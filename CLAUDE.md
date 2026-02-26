@@ -207,6 +207,65 @@ run_tests.sh            # Quick test runner script
 CLAUDE.md               # This file
 ```
 
+## Polymarket Market Taxonomy (researched Feb 2026)
+Polymarket has ~7,767 active markets across 10+ top-level categories. Coverage analysis:
+
+### Categories by volume and scanner coverage
+| Category | Active Markets | Weekly Volume | Scanner Coverage |
+|----------|---------------|---------------|-----------------|
+| **Sports** | Largest | ~$721M/wk (39.6%) | Sports analyzer (Odds API) |
+| **Politics** | ~1,460 | $2.7B+ total | Elections analyzer (RCP + base rates) |
+| **Crypto** | ~2,128 | Large | Crypto price analyzer (CoinGecko) |
+| **Finance** | ~253 | Medium | Finance analyzer (Yahoo) + Earnings analyzer |
+| **Economy** | ~162 | $228.9M total | Fed/Macro analyzer (FRED) |
+| **Pop Culture** | ~330 | $112M total | Not covered (no reliable data source) |
+| **Tech** | ~86 AI + more | Medium | Partially via Finance (stock prices) |
+| **World/Geopolitics** | 191+ new/month | Growing fast | Not covered (no prediction data source) |
+| **Climate/Science** | ~30 weather | Small | Weather analyzer (OWM) |
+
+### Key market structures on Polymarket
+- **Yes/No** — most common: "Will X happen by Y date?"
+- **Either/Or** — two options: "Will SpaceX or OpenAI IPO first?"
+- **Over/Under** — threshold: "Will S&P close above X?"
+- **Multi-Outcome** — N candidates: "Who will win Best Actor?" (5+ options)
+
+### Trending tags (Feb 2026)
+Trump, Iran, ZachXBT, Tweet Markets, Texas Senate, Cuba, Acquisitions, Tariffs, Oscars, Nepal Election, Midterms, Primaries, Epstein, Daily Temperature, Gov Shutdown, Mexico Cartel War, AI, Derivatives, Equities, Fed, SpaceX, IPOs, Earnings, Venezuela, Ukraine, China, Movies, Global Elections
+
+### Not yet covered (potential future analyzers)
+- **Pop Culture / Entertainment**: Oscars, Grammys, box office — no reliable free prediction API
+- **Geopolitics**: War, sanctions, territorial — Metaculus or Manifold as potential sources
+- **Tweet/Mention markets**: Social media activity predictions — would need Twitter API
+- **Resolution detection**: Already-resolved markets not yet settled — News APIs
+
+## Analyzer Prioritization Framework
+When adding new analyzers, prioritize by: **(markets covered × data reliability) / implementation effort**
+
+| Priority | Criterion |
+|----------|-----------|
+| S-tier | Free API + many markets + high reliability (Finance, Earnings, FRED) |
+| A-tier | Easy extension of existing infra (adding tickers) or free API + decent market count |
+| B-tier | Free API but lower reliability or fewer markets |
+| C-tier | Requires paid API or scraping or very few markets |
+
+## Implementation Gotchas Learned
+- **Regex word boundaries** with plurals: `\bdemocrat\b` does NOT match "Democrats" — the `s` continues the word. Use `democrats?` pattern
+- **"raise" vs "hike"**: In Fed context, users say "raise rates" not "hike rates" — both patterns needed in regex
+- **Crypto gate modification**: When allowing crypto price markets through, must check BOTH `has_price_target` AND `has_crypto_ticker` to avoid false positives
+- **CoinGecko coin IDs**: Not always the ticker — e.g., "avalanche-2" not "avax", "matic-network" not "polygon"
+- **FRED series IDs**: Non-obvious — e.g., `CPALTT01USM657N` for CPI YoY%, `DFEDTARU` for Fed upper target
+- **Yahoo Finance earnings**: The `quoteSummary` endpoint with `earningsTrend,earnings` modules gives both historical and forward estimates
+- **Test mocking pattern**: Use `@patch("polymarket_scanner._fetch_X")` to mock the data fetch, not the analyzer itself — tests the analysis logic
+- **Election regex needs**: `elections?`, `democrats?(?:ic)?`, `republicans?`, `midterms?` — plural forms matter
+- **Fed rate regex**: Must handle both "rate cut" (rate + action) AND "cut rates" (action + rate) — two separate alternations
+- **Confidence for crypto**: Should NEVER be "high" — crypto is inherently too volatile
+- **Base rates for elections**: Useful even without polling data — incumbent advantage ~55%, Senate/House control have historical base rates
+
+## User Preferences
+- **Language**: User communicates in French — respond in French for explanations, English for code/docs
+- **Scope**: User prefers ambitious implementations ("implémente absolument tout") — don't hold back
+- **Testing**: Always run `python -m pytest tests/ -v` before committing (CLAUDE.md rule)
+
 ## Common Pitfalls
 - The Gamma API field `outcomePrices` is a JSON **string** like `'["0.94","0.06"]'`, not an array — must be parsed with `json.loads()`
 - The `outcomes` field is also a JSON string: `'["Yes","No"]'`
