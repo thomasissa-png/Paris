@@ -2667,12 +2667,17 @@ def _update_persistence(anomaly_ids: set[str], all_anomalies: dict[str, float]):
             _anomaly_persistence[mid] = current + severity
 
 
-def detect_anomalies(market: dict, now: datetime) -> dict | None:
+def detect_anomalies(market: dict, now: datetime,
+                     _clob_budget: list | None = None) -> dict | None:
     """Run all anomaly detectors on a market.
 
     Returns an anomaly report dict or None if no anomalies found.
-    8 detectors: volume spike, V/L imbalance, price jump, velocity,
-    reversal (pump&dump), order book, off-hours, + convergence scoring.
+    Two-phase approach for performance:
+      Phase 1 (free): volume spike + V/L imbalance — zero HTTP calls.
+      Phase 2 (CLOB): price history + order book — only if Phase 1 found
+                       something OR _clob_budget allows it.
+    Budget: _clob_budget is a mutable [remaining] list shared across markets
+    to cap total CLOB calls per scan (default 60).
     """
     question = market.get("question", "") or market.get("title", "")
     slug = market.get("slug", "")
@@ -2709,7 +2714,9 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
     except (json.JSONDecodeError, TypeError):
         outcomes = []
 
-    # --- Collect anomalies ---
+    # =====================================================================
+    # PHASE 1: Free detectors (no HTTP calls)
+    # =====================================================================
     anomalies: list[dict] = []
 
     # 1) Volume spike (uses volume1wk when available)
@@ -2726,56 +2733,73 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
     if vl_anom:
         anomalies.append(vl_anom)
 
-    # 3) Order book anomalies (spread spike / depth collapse)
-    book_anom = _detect_book_anomaly(market)
-    if book_anom:
-        anomalies.append(book_anom)
+    # =====================================================================
+    # PHASE 2: CLOB-based detectors (HTTP calls — only if budget allows)
+    # Only run if Phase 1 found something OR market has very high volume_24h
+    # =====================================================================
+    has_phase1_signal = len(anomalies) > 0
+    high_activity = volume_24h >= 50000  # High 24h vol worth checking
 
-    # 4) Price-based anomalies (require CLOB price history)
-    clob_ids_raw = market.get("clobTokenIds", "[]")
-    try:
-        clob_ids = json.loads(clob_ids_raw) if isinstance(
-            clob_ids_raw, str) else clob_ids_raw
-    except (json.JSONDecodeError, TypeError):
-        clob_ids = []
+    if _clob_budget is None:
+        _clob_budget = [60]
 
-    # Fetch price history for BOTH outcomes (Yes AND No)
+    run_clob = (has_phase1_signal or high_activity) and _clob_budget[0] > 0
+
     all_histories: list[list[dict]] = []
-    if clob_ids and isinstance(clob_ids, list):
-        for tid in clob_ids[:2]:  # Yes and No tokens
-            h = _fetch_price_history(tid)
-            all_histories.append(h)
 
-    # Analyze each outcome's price history
-    for hist in all_histories:
-        if not hist:
-            continue
-        # 4a) Price jump detection
-        jump_anom = _detect_price_jumps(hist)
-        if jump_anom:
-            # Avoid duplicate price_jump if already found
-            if not any(a["type"] == "price_jump" and
-                       a.get("jump_pct", 0) >= jump_anom.get("jump_pct", 0)
-                       for a in anomalies):
-                anomalies.append(jump_anom)
+    if run_clob:
+        # 3) Order book anomalies (spread spike / depth collapse)
+        book_anom = _detect_book_anomaly(market)
+        if book_anom:
+            anomalies.append(book_anom)
+        _clob_budget[0] -= 1
 
-        # 4b) Price velocity
-        vel_anom = _detect_price_velocity(hist)
-        if vel_anom:
-            if not any(a["type"] == "price_velocity" and
-                       a.get("velocity_pct", 0) >= vel_anom.get("velocity_pct", 0)
-                       for a in anomalies):
-                anomalies.append(vel_anom)
+        # 4) Price-based anomalies (require CLOB price history)
+        clob_ids_raw = market.get("clobTokenIds", "[]")
+        try:
+            clob_ids = json.loads(clob_ids_raw) if isinstance(
+                clob_ids_raw, str) else clob_ids_raw
+        except (json.JSONDecodeError, TypeError):
+            clob_ids = []
 
-        # 4c) Reversal / pump-and-dump detection
-        rev_anom = _detect_price_reversal(hist)
-        if rev_anom:
-            anomalies.append(rev_anom)
+        # Fetch price history for BOTH outcomes (Yes AND No)
+        if clob_ids and isinstance(clob_ids, list):
+            for tid in clob_ids[:2]:  # Yes and No tokens
+                if _clob_budget[0] <= 0:
+                    break
+                h = _fetch_price_history(tid)
+                all_histories.append(h)
+                _clob_budget[0] -= 1
 
-        # 4d) Off-hours activity
-        off_anom = _detect_off_hours_activity(hist)
-        if off_anom:
-            anomalies.append(off_anom)
+        # Analyze each outcome's price history
+        for hist in all_histories:
+            if not hist:
+                continue
+            # 4a) Price jump detection
+            jump_anom = _detect_price_jumps(hist)
+            if jump_anom:
+                if not any(a["type"] == "price_jump" and
+                           a.get("jump_pct", 0) >= jump_anom.get("jump_pct", 0)
+                           for a in anomalies):
+                    anomalies.append(jump_anom)
+
+            # 4b) Price velocity
+            vel_anom = _detect_price_velocity(hist)
+            if vel_anom:
+                if not any(a["type"] == "price_velocity" and
+                           a.get("velocity_pct", 0) >= vel_anom.get("velocity_pct", 0)
+                           for a in anomalies):
+                    anomalies.append(vel_anom)
+
+            # 4c) Reversal / pump-and-dump detection
+            rev_anom = _detect_price_reversal(hist)
+            if rev_anom:
+                anomalies.append(rev_anom)
+
+            # 4d) Off-hours activity
+            off_anom = _detect_off_hours_activity(hist)
+            if off_anom:
+                anomalies.append(off_anom)
 
     if not anomalies:
         return None
@@ -3656,6 +3680,9 @@ def scan() -> dict:
             _log_prediction(opp)
 
     # --- Anomaly detection pass (runs on ALL fetched markets) ---
+    # CLOB budget: shared mutable list [remaining] — caps total HTTP calls
+    # to avoid scan timeouts.  60 calls ≈ ~20 markets deep-scanned.
+    clob_budget: list[int] = [60]
     anomalies_list: list[dict] = []
     seen_anomaly: set[str] = set()
     anomaly_error = None
@@ -3666,7 +3693,7 @@ def scan() -> dict:
                 if amid in seen_anomaly:
                     continue
                 seen_anomaly.add(amid)
-            anomaly = detect_anomalies(m, now)
+            anomaly = detect_anomalies(m, now, _clob_budget=clob_budget)
             if anomaly:
                 anomalies_list.append(anomaly)
         # Sort by severity (most suspicious first)
@@ -4400,7 +4427,7 @@ function refresh(){
   var lb=document.getElementById('refreshLabel');
   btn.disabled=true;sp.style.display='inline-block';lb.textContent='Loading';
 
-  fetch('/api/scan').then(function(r){return r.json()}).then(function(d){
+  fetch('/api/scan',{signal:AbortSignal.timeout(120000)}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(function(d){
     document.getElementById('skeleton').style.display='none';
     document.getElementById('content').style.display='block';
 

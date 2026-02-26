@@ -3597,7 +3597,7 @@ class TestDetectAnomalies:
             {"t": 4000, "p": 0.74},
         ]
         m = self._make_anomaly_market(
-            now, volume="50000", volume24hr="1000", liquidity="50000"
+            now, volume="50000", volume24hr="60000", liquidity="50000"
         )
         result = detect_anomalies(m, now)
         assert result is not None
@@ -3611,7 +3611,7 @@ class TestDetectAnomalies:
             for i in range(8)
         ]
         m = self._make_anomaly_market(
-            now, volume="50000", volume24hr="1000", liquidity="50000"
+            now, volume="50000", volume24hr="60000", liquidity="50000"
         )
         result = detect_anomalies(m, now)
         assert result is not None
@@ -4115,7 +4115,7 @@ class TestDetectAnomaliesV2:
             {"t": 5000, "p": 0.53},  # retrace
         ]
         m = self._make_anomaly_market(
-            now, volume="50000", volume24hr="1000", liquidity="50000"
+            now, volume="50000", volume24hr="60000", liquidity="50000"
         )
         result = detect_anomalies(m, now)
         assert result is not None
