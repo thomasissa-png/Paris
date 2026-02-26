@@ -20,6 +20,7 @@ Optional env vars:
 """
 
 import json
+import logging
 import math
 import os
 import re
@@ -48,7 +49,7 @@ MIN_LIQUIDITY = 5000
 CACHE_TTL = 25          # seconds
 MAX_ANN_ROI = 1000.0    # cap annualized ROI to avoid absurd display
 EST_FEE_PCT = 2.0       # estimated round-trip trading fees (%)
-MIN_EDGE = 0.10         # minimum edge (10%) to qualify as "edge" tier
+MIN_EDGE = 0.05         # minimum edge (5%) to qualify as "edge" tier
 PORT = 5000
 
 # --- External analysis (optional API keys) ---
@@ -70,10 +71,25 @@ CRYPTO_RE = re.compile(
     r"chainlink|polkadot|shiba\s*inu|pepe\s*coin|memecoin|"
     r"token\s+price|coin\s+price|crypto\s+price|"
     r"defi|nft|blockchain|stablecoin|altcoin|"
-    r"binance|coinbase|uniswap|aave|satoshi|gwei"
+    r"binance|uniswap|aave|satoshi|gwei"
     r")\b",
     re.IGNORECASE,
 )
+# "coinbase" removed from CRYPTO_RE — conflicts with COIN stock ticker.
+# Coinbase stock markets ("Coinbase stock above $300?") are legitimate finance.
+# Actual crypto questions about "Coinbase exchange" will still match via "crypto" keyword.
+_COINBASE_STOCK_RE = re.compile(
+    r"\bcoinbase\b(?!\s+(?:stock|share|price|ipo|earning))", re.IGNORECASE
+)
+
+
+def is_crypto(question: str) -> bool:
+    if CRYPTO_RE.search(question):
+        return True
+    # "coinbase" alone (not "coinbase stock/share/price") → crypto
+    if _COINBASE_STOCK_RE.search(question):
+        return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Weather Analyzer — external edge detection
@@ -94,8 +110,21 @@ CITY_COORDS: dict[str, tuple[float, float]] = {
     "san francisco": (37.77, -122.42), "sf": (37.77, -122.42),
     "las vegas": (36.17, -115.14), "portland": (45.51, -122.68),
     "detroit": (42.33, -83.05), "minneapolis": (44.98, -93.27),
+    "tampa": (27.95, -82.46), "charlotte": (35.23, -80.84),
+    "columbus": (39.96, -82.99), "indianapolis": (39.77, -86.16),
+    "jacksonville": (30.33, -81.66), "memphis": (35.15, -90.05),
+    "oklahoma city": (35.47, -97.52), "raleigh": (35.78, -78.64),
+    "baltimore": (39.29, -76.61), "milwaukee": (43.04, -87.91),
+    "kansas city": (39.10, -94.58), "sacramento": (38.58, -121.49),
+    "cleveland": (41.50, -81.69), "pittsburgh": (40.44, -80.00),
+    "cincinnati": (39.10, -84.51), "orlando": (28.54, -81.38),
+    "st. louis": (38.63, -90.20), "st louis": (38.63, -90.20),
+    "salt lake city": (40.76, -111.89), "san jose": (37.34, -121.89),
+    "new orleans": (29.95, -90.07),
     "london": (51.51, -0.13), "paris": (48.86, 2.35), "tokyo": (35.68, 139.69),
     "toronto": (43.65, -79.38), "sydney": (-33.87, 151.21),
+    "berlin": (52.52, 13.41), "madrid": (40.42, -3.70), "rome": (41.90, 12.50),
+    "mexico city": (19.43, -99.13), "mumbai": (19.08, 72.88),
 }
 
 # --- Keyword-based weather question detection (flexible order) ---
@@ -109,10 +138,56 @@ _RAIN_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 # Step 2: extract threshold + unit (city found separately via _find_city)
-_TEMP_THRESHOLD_RE = re.compile(
-    r"(?P<threshold>\d+(?:\.\d+)?)\s*(?P<unit>[°]?\s*[FCfc]|fahrenheit|celsius)?",
+# Anchored patterns: prefer number with explicit unit, fallback to number after keywords
+_TEMP_THRESHOLD_UNIT_RE = re.compile(
+    r"(?P<threshold>\d+(?:\.\d+)?)\s*(?P<unit>[°]\s*[FCfc]|fahrenheit|celsius|[FCfc]\b)",
     re.IGNORECASE,
 )
+_TEMP_THRESHOLD_KEYWORD_RE = re.compile(
+    r"(?:above|over|exceed|reach|hit|at least|below|under|drop to)\s+"
+    r"(?P<threshold>\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Step 3: optional specific date in question ("March 5", "on February 28")
+_MONTH_MAP = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_DATE_IN_QUESTION_RE = re.compile(
+    r"\b(?P<month>" + "|".join(_MONTH_MAP.keys()) + r")\s+(?P<day>\d{1,2})\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_target_date(question: str, now_dt: datetime) -> datetime | None:
+    """Extract a specific target date from question text (e.g. 'March 5').
+
+    Returns a timezone-aware datetime at end-of-day UTC, or None.
+    """
+    m = _DATE_IN_QUESTION_RE.search(question)
+    if not m:
+        return None
+    month = _MONTH_MAP.get(m.group("month").lower())
+    day = int(m.group("day"))
+    if not month or day < 1 or day > 31:
+        return None
+    year = now_dt.year
+    try:
+        target = datetime(year, month, day, 23, 59, 59, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    # If target is in the past, try next year
+    if target < now_dt:
+        try:
+            target = datetime(year + 1, month, day, 23, 59, 59, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return target
+
 
 _owm_cache: dict[str, tuple[float, object]] = {}
 _owm_lock = threading.Lock()
@@ -226,14 +301,22 @@ def analyze_weather(question: str, end_dt: datetime) -> dict | None:
     if not entries:
         return None
 
-    # Filter entries up to market end date
+    # Filter entries: use specific date if found, otherwise up to market end date
     now_dt = datetime.now(timezone.utc)
+    target_dt = _parse_target_date(question, now_dt)
+    filter_end = target_dt if target_dt and target_dt <= end_dt else end_dt
+
     relevant = []
     for e in entries:
         dt_unix = e.get("dt", 0)
         entry_dt = datetime.fromtimestamp(dt_unix, tz=timezone.utc)
-        if entry_dt <= end_dt:
-            relevant.append(e)
+        if target_dt:
+            # For specific date: only entries on that day
+            if entry_dt.date() == target_dt.date():
+                relevant.append(e)
+        else:
+            if entry_dt <= filter_end:
+                relevant.append(e)
     if not relevant:
         return None
 
@@ -242,16 +325,26 @@ def analyze_weather(question: str, end_dt: datetime) -> dict | None:
 
     # --- Temperature analysis (sigmoid calibration, item 3) ---
     if is_temp:
-        # Extract threshold from question
-        m_thresh = _TEMP_THRESHOLD_RE.search(question)
-        if not m_thresh:
-            return None
-        threshold = float(m_thresh.group("threshold"))
-        unit = m_thresh.group("unit")
+        # Extract threshold: prefer number with unit (80F), fallback to number after keyword
+        m_thresh = _TEMP_THRESHOLD_UNIT_RE.search(question)
+        if m_thresh:
+            threshold = float(m_thresh.group("threshold"))
+            unit = m_thresh.group("unit")
+        else:
+            m_thresh = _TEMP_THRESHOLD_KEYWORD_RE.search(question)
+            if not m_thresh:
+                return None
+            threshold = float(m_thresh.group("threshold"))
+            unit = None
         threshold_f = _to_fahrenheit(threshold, unit)
 
-        is_above = any(w in q_lower for w in
-                       ["above", "over", "exceed", "reach", "hit", "at least"])
+        is_below = any(w in q_lower for w in
+                       ["below", "under", "stay under", "drop to", "fall to",
+                        "less than", "lower than", "won't exceed", "not reach",
+                        "not exceed", "won't reach"])
+        is_above = not is_below and any(w in q_lower for w in
+                       ["above", "over", "exceed", "reach", "hit", "at least",
+                        "higher than", "more than", "surpass", "top"])
 
         highs = [e.get("main", {}).get("temp_max", 0) for e in relevant]
         max_high = max(highs) if highs else 0
@@ -259,14 +352,15 @@ def analyze_weather(question: str, end_dt: datetime) -> dict | None:
         # Sigmoid calibration: prob = 1/(1 + exp(-margin/k))
         # margin = max_forecast - threshold (for "above" questions)
         # k=3 gives smooth transition around threshold
-        if is_above:
-            margin = max_high - threshold_f
-            prob = 1.0 / (1.0 + math.exp(-margin / 3.0))
-            direction = "above"
-        else:
+        if is_below:
             margin = threshold_f - max_high
             prob = 1.0 / (1.0 + math.exp(-margin / 3.0))
             direction = "below"
+        else:
+            # Default to "above" for ambiguous phrasing
+            margin = max_high - threshold_f
+            prob = 1.0 / (1.0 + math.exp(-margin / 3.0))
+            direction = "above"
 
         return {
             "estimated_prob": round(prob, 3),
@@ -280,18 +374,41 @@ def analyze_weather(question: str, end_dt: datetime) -> dict | None:
 
     # --- Rain/precipitation analysis (composite formula, item 5) ---
     if is_rain:
-        pop_values = [e.get("pop", 0) for e in relevant]
+        is_snow = "snow" in q_lower
+
+        if is_snow:
+            # For snow questions: use only entries with snow in weather description
+            # AND weight by pop for those entries
+            snow_pops = []
+            for e in relevant:
+                weather_list = e.get("weather", [])
+                has_snow = any("snow" in w.get("main", "").lower()
+                               for w in weather_list)
+                pop = e.get("pop", 0)
+                if has_snow:
+                    snow_pops.append(pop)
+                else:
+                    # Scale down non-snow entries (some precip could turn to snow)
+                    temp = e.get("main", {}).get("temp", 40)
+                    if temp <= 34:  # near freezing — precip likely snow
+                        snow_pops.append(pop * 0.8)
+                    elif temp <= 38:
+                        snow_pops.append(pop * 0.3)
+                    # else: too warm, skip
+            pop_values = snow_pops if snow_pops else [0.0]
+            precip_type = "snow"
+        else:
+            pop_values = [e.get("pop", 0) for e in relevant]
+            precip_type = "rain"
+
         max_pop = max(pop_values) if pop_values else 0
         avg_pop = sum(pop_values) / len(pop_values) if pop_values else 0
 
-        # Composite: P(at least one period with rain) = 1 - prod(1 - pop_i)
+        # Composite: P(at least one period with precip) = 1 - prod(1 - pop_i)
         no_precip = 1.0
         for pop in pop_values:
             no_precip *= (1.0 - pop)
         prob = 1.0 - no_precip
-
-        is_snow = "snow" in q_lower
-        precip_type = "snow" if is_snow else "rain"
 
         return {
             "estimated_prob": round(prob, 3),
@@ -418,20 +535,32 @@ def _fetch_yahoo_chart(ticker: str) -> dict | None:
         if len(closes) < 10 or current_price <= 0:
             return None
 
-        # Daily volatility from log returns (RMS)
+        # Daily volatility from log returns — EWMA (λ=0.94, RiskMetrics style)
+        # Weights recent observations more heavily for reactive vol estimate
         log_returns = [math.log(closes[i] / closes[i - 1])
                        for i in range(1, len(closes))
                        if closes[i - 1] > 0]
         if not log_returns:
             return None
-        daily_vol = (sum(r ** 2 for r in log_returns) / len(log_returns)) ** 0.5
+        ewma_lambda = 0.94
+        var_ewma = log_returns[0] ** 2
+        for r in log_returns[1:]:
+            var_ewma = ewma_lambda * var_ewma + (1 - ewma_lambda) * r ** 2
+        daily_vol = math.sqrt(var_ewma)
 
         result_data = {"price": current_price, "daily_vol": daily_vol,
                        "ticker": ticker}
         with _finance_lock:
             _finance_cache[ticker] = (_time.time(), result_data)
         return result_data
-    except Exception:
+    except requests.exceptions.HTTPError as exc:
+        _logger.warning("Yahoo Finance HTTP error for %s: %s", ticker, exc)
+        return None
+    except requests.exceptions.Timeout:
+        _logger.warning("Yahoo Finance timeout for %s", ticker)
+        return None
+    except Exception as exc:
+        _logger.warning("Yahoo Finance error for %s: %s", ticker, exc)
         return None
 
 
@@ -468,16 +597,22 @@ def analyze_finance(question: str, end_dt: datetime) -> dict | None:
     now_dt = datetime.now(timezone.utc)
     days = max((end_dt - now_dt).total_seconds() / 86400, 0.1)
 
-    # Log-normal probability
+    # Log-normal probability with drift (Black-Scholes style)
+    # drift = (r - σ²/2) × T, using risk-free rate ~4.5% annualized
+    RISK_FREE_ANNUAL = 0.045
+    r_daily = RISK_FREE_ANNUAL / 252
     sigma_period = daily_vol * math.sqrt(days)
+    drift = (r_daily - 0.5 * daily_vol ** 2) * days
     if sigma_period < 0.001:
         prob_above = 1.0 if current >= threshold else 0.0
     else:
-        z = math.log(threshold / current) / sigma_period
+        z = (math.log(threshold / current) - drift) / sigma_period
         prob_above = 1.0 - _normal_cdf(z)
 
     q_lower = question.lower()
-    is_below = any(w in q_lower for w in ["below", "under", "fall", "drop"])
+    is_below = any(w in q_lower for w in
+                   ["below", "under", "fall", "drop", "decline", "crash",
+                    "sink", "less than", "lower than"])
     prob = (1.0 - prob_above) if is_below else prob_above
 
     # Confidence: shorter horizon + closer to target = more reliable
@@ -646,6 +781,8 @@ def _consensus_probability(event: dict, team_name: str) -> tuple[float, int]:
     """Calculate devigged consensus probability for a team.
 
     Averages implied probability across all bookmakers after removing vig.
+    Handles 3-way markets (with draw) properly — draw probability is excluded
+    from team probability, not split between teams.
     Returns (probability, num_bookmakers).
     """
     probs: list[float] = []
@@ -680,11 +817,26 @@ def _consensus_probability(event: dict, team_name: str) -> tuple[float, int]:
     return sum(probs) / len(probs), len(probs)
 
 
+def _has_draw_market(event: dict) -> bool:
+    """Check if event has a draw outcome (3-way market like soccer)."""
+    for bookmaker in event.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+            outcomes = market.get("outcomes", [])
+            if len(outcomes) >= 3:
+                for out in outcomes:
+                    if out.get("name", "").lower() == "draw":
+                        return True
+    return False
+
+
 def analyze_sports(question: str, end_dt: datetime) -> dict | None:
     """Analyze sports market using bookmaker consensus odds.
 
     Fetches odds from The Odds API, matches event by team names,
     calculates devigged consensus probability across bookmakers.
+    Confidence combines time horizon AND bookmaker count.
     Requires THE_ODDS_API_KEY env var.
     """
     if not ODDS_API_KEY:
@@ -712,19 +864,31 @@ def analyze_sports(question: str, end_dt: datetime) -> dict | None:
     home = matched.get("home_team", "?")
     away = matched.get("away_team", "?")
 
-    if num_books >= 5:
+    # Confidence: combine bookmaker count AND time horizon
+    now_dt = datetime.now(timezone.utc)
+    days_to_event = max((end_dt - now_dt).total_seconds() / 86400, 0)
+    # Bookmaker score: 2=0, 3-4=1, 5+=2
+    book_score = 0 if num_books < 3 else (1 if num_books < 5 else 2)
+    # Time score: <3d=2, 3-14d=1, 14d+=0
+    time_score = 2 if days_to_event < 3 else (1 if days_to_event < 14 else 0)
+    combined = book_score + time_score  # 0-4
+    if combined >= 3:
         confidence = "high"
-    elif num_books >= 3:
+    elif combined >= 2:
         confidence = "medium"
     else:
         confidence = "low"
+
+    draw_note = ""
+    if _has_draw_market(matched):
+        draw_note = " (3-way: draw possible)"
 
     return {
         "estimated_prob": round(prob, 3),
         "source": "The Odds API",
         "analysis": (f"Consensus {num_books} bookmakers: {target} "
                      f"@ {prob*100:.0f}%. "
-                     f"Match: {home} vs {away}."),
+                     f"Match: {home} vs {away}.{draw_note}"),
         "confidence": confidence,
         "data_point": f"{prob*100:.0f}% ({num_books} books)",
     }
@@ -770,22 +934,41 @@ _cache: dict = {"data": None, "ts": 0.0}
 # API — paginated fetch
 # ---------------------------------------------------------------------------
 
+_logger = logging.getLogger("polymarket_scanner")
+
+
 def fetch_all_markets() -> list[dict]:
-    """Fetch up to MAX_PAGES * BATCH_SIZE markets with pagination."""
+    """Fetch up to MAX_PAGES * BATCH_SIZE markets with pagination.
+
+    Retries each page up to 2 times on failure with 1s backoff.
+    Logs warnings on partial fetches.
+    """
     all_markets: list[dict] = []
     for page in range(MAX_PAGES):
-        try:
-            params = {**API_PARAMS, "limit": BATCH_SIZE, "offset": page * BATCH_SIZE}
-            resp = requests.get(GAMMA_API, params=params, timeout=10)
-            resp.raise_for_status()
-            batch = resp.json()
-            if not batch:
+        params = {**API_PARAMS, "limit": BATCH_SIZE, "offset": page * BATCH_SIZE}
+        batch = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(GAMMA_API, params=params, timeout=10)
+                resp.raise_for_status()
+                batch = resp.json()
                 break
-            all_markets.extend(batch)
-            if len(batch) < BATCH_SIZE:
-                break
-        except Exception:
-            break  # use what we have
+            except Exception as exc:
+                if attempt < 2:
+                    _time.sleep(1)
+                    _logger.warning("Gamma API page %d attempt %d failed: %s",
+                                    page, attempt + 1, exc)
+                else:
+                    _logger.error("Gamma API page %d failed after 3 attempts: %s",
+                                  page, exc)
+        if not batch:
+            if all_markets:
+                _logger.warning("Gamma API: got %d markets from %d/%d pages",
+                                len(all_markets), page, MAX_PAGES)
+            break
+        all_markets.extend(batch)
+        if len(batch) < BATCH_SIZE:
+            break
     return all_markets
 
 # ---------------------------------------------------------------------------
@@ -809,8 +992,7 @@ def parse_date(ds: str | None) -> datetime | None:
         return None
 
 
-def is_crypto(question: str) -> bool:
-    return bool(CRYPTO_RE.search(question))
+# is_crypto() defined above near CRYPTO_RE
 
 
 def truncate(s: str, n: int = 15) -> str:
@@ -1085,7 +1267,8 @@ def process_market(m: dict, now: datetime) -> dict | None:
     if reason_type == "arbitrage":
         ev_per_100 = round((1.0 - price_sum) / price_sum * 100, 2) if price_sum > 0 else 0
         risk_per_100 = 0.0
-        fee_per_100 = round(EST_FEE_PCT, 2)
+        # Fees scale with number of trades required
+        fee_per_100 = round(EST_FEE_PCT * num_outcomes / 2.0, 2)
         net_per_100 = round(ev_per_100 - fee_per_100, 2)
         arb_warning = f"{num_outcomes} trades requis"
     elif reason_type == "edge" and edge_analysis:
@@ -1111,6 +1294,19 @@ def process_market(m: dict, now: datetime) -> dict | None:
     # --- Vol/Liq ratio ---
     vol_liq = round(volume / liquidity, 1) if liquidity > 0 else 999
     thin = liquidity < 10000 or vol_liq > 20
+
+    # --- Spread/slippage warning for arbs ---
+    spread_warning = ""
+    if reason_type == "arbitrage":
+        liq_per_outcome = liquidity / num_outcomes if num_outcomes > 0 else liquidity
+        if liq_per_outcome < 5000:
+            spread_warning = (f"~${liq_per_outcome:,.0f}/outcome — "
+                              f"liquidité insuffisante, spread probable")
+        elif liquidity < 25000:
+            spread_warning = "Faible liquidité — spread peut annuler le gain"
+        elif num_outcomes > 2 and liq_per_outcome < 15000:
+            spread_warning = (f"Multi-outcome ({num_outcomes}), "
+                              f"~${liq_per_outcome:,.0f}/outcome — slippage probable")
 
     # --- Composite score ---
     ext_edge = abs(edge_analysis["edge"]) if edge_analysis else 0.0
@@ -1149,6 +1345,7 @@ def process_market(m: dict, now: datetime) -> dict | None:
         "fee_per_100": fee_per_100,
         "net_per_100": net_per_100,
         "arb_warning": arb_warning,
+        "spread_warning": spread_warning,
         "edge_analysis": edge_analysis,
         "score": score,
         "category": category,
@@ -1649,13 +1846,15 @@ function renderCard(item){
       +'<span class="trade-guaranteed">GARANTI</span>'
       +'<span class="trade-ev trade-ev-pos">Net ~$'+item.net_per_100.toFixed(2)+' (frais ~'+item.fee_per_100.toFixed(0)+'%)</span>';
     if(item.arb_warning)tr+='<div class="trade-warning">&#9888; '+esc(item.arb_warning)+'</div>';
+    if(item.spread_warning)tr+='<div class="trade-warning">&#9888; '+esc(item.spread_warning)+'</div>';
   }else if(item.reason_type==='edge'&&item.edge_analysis){
     var ea=item.edge_analysis;
     var edgePct=(Math.abs(ea.edge)*100).toFixed(0);
     tr+='<span class="trade-edge">EDGE +'+edgePct+'%</span>'
       +'<span class="trade-profit">EV +$'+item.ev_per_100.toFixed(2)+'</span>'
       +'<span class="trade-per">/ $100</span>'
-      +'<span class="trade-ann">'+(item.ann_roi_capped?'&ge;':'')+fmtRoi(item.ann_roi)+' ann.</span>';
+      +'<span class="trade-ann">'+(item.ann_roi_capped?'&ge;':'')+fmtRoi(item.ann_roi)+' ann.</span>'
+      +'<span class="trade-ev trade-ev-pos">Net ~$'+item.net_per_100.toFixed(2)+' (frais ~'+item.fee_per_100.toFixed(0)+'%)</span>';
   }else{
     tr+='<span class="trade-speculative">SPECULATIF</span>'
       +'<span class="trade-ev trade-ev-zero">EV ~$0 &middot; Risque -$'+item.risk_per_100.toFixed(0)+'</span>';
@@ -1786,6 +1985,9 @@ def index():
     return Response(HTML_TEMPLATE, content_type="text/html")
 
 
+_scan_lock = threading.Lock()
+
+
 @app.route("/api/scan")
 def api_scan():
     now = _time.time()
@@ -1793,11 +1995,19 @@ def api_scan():
         if _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL:
             return jsonify(_cache["data"])
 
-    data = scan()
+    # Single-flight: only one scan() at a time, others wait and get cached result
+    with _scan_lock:
+        # Re-check cache — another thread may have just populated it
+        with _cache_lock:
+            now2 = _time.time()
+            if _cache["data"] is not None and (now2 - _cache["ts"]) < CACHE_TTL:
+                return jsonify(_cache["data"])
 
-    with _cache_lock:
-        _cache["data"] = data
-        _cache["ts"] = _time.time()
+        data = scan()
+
+        with _cache_lock:
+            _cache["data"] = data
+            _cache["ts"] = _time.time()
 
     return jsonify(data)
 

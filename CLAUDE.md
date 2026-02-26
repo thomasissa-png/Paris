@@ -23,7 +23,7 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 ### 4 Tiers
 | Tier | Label | Criteria | Edge |
 |------|-------|----------|------|
-| **edge** | Edge Informationnel | External data divergence > 10% | Real EV from better information |
+| **edge** | Edge Informationnel | External data divergence > 5% | Real EV from better information |
 | **super** | Gain Garanti | Arb with deviation > 4% | Guaranteed profit after fees |
 | **interesting** | Petit Arb | Arb 2-4% | Guaranteed profit, tighter margin |
 | **watch** | Speculatif | max_price > 90% (near-certain) | EV ≈ $0, involves luck |
@@ -43,16 +43,17 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 - `MIN_LIQUIDITY = 5000` — markets below $5K liquidity are unexecutable
 - `MIN_VOLUME = 1000` — minimum lifetime volume
 - `MAX_ANN_ROI = 1000.0` — cap annualized ROI to avoid absurd display
-- `EST_FEE_PCT = 2.0` — estimated round-trip trading fees
-- `MIN_EDGE = 0.10` — minimum 10% divergence for edge tier
+- `EST_FEE_PCT = 2.0` — estimated round-trip trading fees per trade (scales with num_outcomes)
+- `MIN_EDGE = 0.05` — minimum 5% divergence for edge tier
 - `max_price > 0.995` → filtered (negligible profit) — **except** for edge tier (edge checked first)
 - Volume 24h = 0 (when data available) → filtered as dead market
 - Arb deviation < 2% → filtered (unprofitable after fees)
 
 ### EV Display
 - **Arbs**: `+$X.XX / $100` gross profit + `Net ~$Y.YY (frais ~2%)` after fees
-- **Edge**: `EDGE +X%` badge + `EV +$Y.YY / $100` + analysis box with source data
+- **Edge**: `EDGE +X%` badge + `EV +$Y.YY / $100` + `Net ~$Z.ZZ (frais ~N%)` + analysis box with source data
 - **Non-arbs**: no profit shown — only `EV ~$0 · Risque -$100`
+- **Spread warning**: `⚠ Faible liquidité` for low-liquidity arbs, per-outcome liquidity check for multi-outcome
 - **GARANTI** badge (green) for arbs, **EDGE** badge (green) for edge, **SPECULATIF** badge (orange) for non-arbs
 - **Warning**: `⚠ N trades requis` for arbs (execution risk)
 
@@ -64,8 +65,9 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 - **Env var**: `OPENWEATHERMAP_API_KEY`
 - **Startup validation**: API key tested at startup, warns if invalid/missing
 - **Detects**: temperature threshold markets, rain/snow probability markets
-- **Question parsing**: keyword-based detection (flexible order), not rigid regex
-- **Cities**: 30+ pre-mapped US + major world cities (lat/lon lookup). "la" alias removed (false positives)
+- **Question parsing**: keyword-based detection (flexible order), not rigid regex. Target date extraction ("March 5") narrows forecast to specific day
+- **Snow vs Rain**: differentiated — snow questions use OWM weather type + temperature-based probability scaling
+- **Cities**: 50+ pre-mapped US + major world cities (lat/lon lookup). "la" alias removed (false positives)
 - **Cache**: 10 min TTL per city, expired entries purged automatically, thread-safe
 - **Temperature**: sigmoid calibration `P = 1/(1+exp(-margin/3))` where margin = max_forecast - threshold
 - **Rain**: composite formula `P(at least one) = 1 - ∏(1 - pop_i)` — not max(PoP)
@@ -75,8 +77,8 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 - **API**: Yahoo Finance public chart endpoint (no API key needed — always active)
 - **Detects**: stock price threshold markets ("Will Tesla reach $X?"), index targets, commodity prices
 - **Tickers**: 20+ pre-mapped US stocks, indices (S&P, Nasdaq, Dow), commodities (gold, oil, silver)
-- **Model**: Log-normal diffusion `P(S>K) = Φ(-z)` where `z = ln(K/S) / (σ√T)` — Black-Scholes style
-- **Volatility**: calculated from 3-month daily log returns (RMS)
+- **Model**: Log-normal diffusion with drift `P(S>K) = Φ(-z)` where `z = (ln(K/S) - (r-σ²/2)T) / (σ√T)`, r=4.5% annual
+- **Volatility**: EWMA (λ=0.94, RiskMetrics) from 3-month daily log returns — weights recent data more heavily
 - **Cache**: 5 min TTL per ticker, expired entries purged automatically, thread-safe
 - **Confidence**: 0-7d = high, 7-30d = medium, 30d+ = low
 
@@ -89,6 +91,8 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 - **Team matching**: keyword overlap between Polymarket question and event teams (min 4-char match)
 - **Probability**: devigged consensus across multiple bookmakers (raw_prob / overround)
 - **Minimum**: requires >= 2 bookmakers for reliable consensus
+- **Draw handling**: 3-way markets (soccer, boxing) detected — draw noted in analysis
+- **Confidence**: hybrid score combining bookmaker count AND time horizon (not just books)
 - **Cache**: 5 min TTL per sport, expired entries purged automatically, thread-safe
 
 ### Common Edge Properties
@@ -101,7 +105,7 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 - **Resolution**: News APIs — detect already-resolved markets not yet settled
 
 ## Key Design Decisions
-- **Crypto filter**: Regex with ONLY unambiguous tokens — short tokens like `sol`, `eth`, `ada`, `link`, `dot` were intentionally REMOVED because they cause false positives on words like "resolution", "whether", "Canada"
+- **Crypto filter**: Regex with ONLY unambiguous tokens — short tokens like `sol`, `eth`, `ada`, `link`, `dot` removed (false positives). `coinbase` removed from regex — handled separately to allow "Coinbase stock" (COIN ticker) through finance analyzer while blocking "Coinbase exchange" (crypto context)
 - **Question NOT truncated** in backend — CSS `-webkit-line-clamp` handles display truncation
 - **Design system**: Polymarket brand identity — primary blue `#2e5cff`, green `#47c97a` (Yes), red `#ff6464` (No), dark bg `#12151f`, font Open Sauce One / Inter
 - **Overround excluded**: sum > 1.0 is the market's margin — excluded entirely (not shown)
@@ -113,6 +117,12 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 - **Analyzer call order**: weather → finance → sports via `run_analyzers()`. Order is deterministic and documented
 - **All API calls synchronous**: acceptable because caches deduplicate requests. Async would add complexity for minimal gain at current scale
 - **Finance always active**: Yahoo Finance needs no key — every scan checks stock/index markets for free
+- **Gamma API retry**: 3 attempts per page with 1s backoff, logging warnings on partial fetches
+- **Cache single-flight**: `_scan_lock` ensures only one `scan()` runs at a time; concurrent requests wait for cached result
+- **Proportional fees**: `fee = EST_FEE_PCT × num_outcomes / 2` — multi-outcome arbs pay more fees per outcome
+- **Spread warnings**: per-outcome liquidity check (`liquidity / num_outcomes`) warns when execution risk is high
+- **Temperature regex**: anchored — prefers `80F` (number+unit) over `5` (bare number). Fallback to number after directional keyword
+- **Yahoo Finance logging**: HTTP errors, timeouts logged via `_logger` — no silent failures
 
 ## Testing
 **ALWAYS run tests before committing**:
@@ -120,7 +130,7 @@ The scanner runs 3 analyzers to detect informational edge. Analyzers are **optio
 python -m pytest tests/ -v
 ```
 
-Test file: `tests/test_scanner.py` (203 tests) — covers:
+Test file: `tests/test_scanner.py` (241 tests) — covers:
 - classify(): arb tiers (super/interesting), edge tier (before 0.995), near-certain watch-only, overround excluded, boundaries
 - compute_score(): edge > arb >> near-certain, time/liquidity weighting, confidence multiplier
 - Weather analyzer: city detection, sigmoid temp, composite rain, flexible keywords, horizon confidence, mocked OWM API

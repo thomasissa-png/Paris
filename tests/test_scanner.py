@@ -33,13 +33,16 @@ from polymarket_scanner import (
     MIN_EDGE,
     MIN_LIQUIDITY,
     SPORT_KEYS,
+    _COINBASE_STOCK_RE,
     _consensus_probability,
     _find_city,
     _find_sport,
     _find_ticker,
+    _has_draw_market,
     _horizon_confidence,
     _match_event,
     _normal_cdf,
+    _parse_target_date,
     _to_fahrenheit,
     analyze_finance,
     analyze_sports,
@@ -219,9 +222,16 @@ class TestClassifyEdge:
 
     def test_edge_below_min_edge(self):
         """Edge < MIN_EDGE → falls through to normal classify."""
-        ea = {"edge": 0.05, "source": "OpenWeatherMap"}
+        ea = {"edge": 0.03, "source": "OpenWeatherMap"}
         tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=ea)
         assert tier is None  # 70% = not near_certain, not arb
+
+    def test_edge_at_5pct_qualifies(self):
+        """Edge = 5% (MIN_EDGE) → qualifies as edge tier."""
+        ea = {"edge": 0.05, "source": "OpenWeatherMap"}
+        tier, _, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
 
     def test_edge_negative_large(self):
         """Negative edge (market overprices) → still triggers if abs >= MIN_EDGE."""
@@ -1654,3 +1664,381 @@ class TestRunAnalyzers:
         mock_s.return_value = None
         end_dt = datetime.now(timezone.utc) + timedelta(days=5)
         assert run_analyzers("test", end_dt) is None
+
+
+# =========================================================================
+# Audit fix #1: MIN_EDGE lowered to 5%
+# =========================================================================
+
+class TestMinEdgeLowered:
+    """MIN_EDGE should be 0.05, not 0.10."""
+
+    def test_min_edge_is_5pct(self):
+        assert MIN_EDGE == 0.05
+
+    def test_edge_7pct_qualifies(self):
+        """7% edge should now qualify as edge tier."""
+        ea = {"edge": 0.07, "source": "Yahoo Finance"}
+        tier, _, rtype = classify(0.60, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
+
+
+# =========================================================================
+# Audit fix #2: Coinbase crypto/finance conflict
+# =========================================================================
+
+class TestCoinbaseConflict:
+    """Coinbase stock markets should NOT be filtered as crypto."""
+
+    def test_coinbase_stock_not_crypto(self):
+        assert is_crypto("Will Coinbase stock reach $300?") is False
+
+    def test_coinbase_share_not_crypto(self):
+        assert is_crypto("Coinbase share price above $250?") is False
+
+    def test_coinbase_price_not_crypto(self):
+        assert is_crypto("Coinbase price above $200?") is False
+
+    def test_coinbase_alone_is_crypto(self):
+        """'Coinbase' without stock context → crypto (the exchange)."""
+        assert is_crypto("Will Coinbase list the new token?") is True
+
+    def test_coinbase_exchange_is_crypto(self):
+        assert is_crypto("Coinbase regulatory issues with crypto") is True
+
+
+# =========================================================================
+# Audit fix #3: Black-Scholes drift
+# =========================================================================
+
+class TestFinanceDrift:
+    """Finance model should include drift term."""
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_drift_increases_above_probability(self, mock_fetch):
+        """With drift, P(above target below current) should benefit.
+
+        Drift = ~4.5%/yr risk-free rate. For a target slightly BELOW current
+        price with enough time, drift clearly pushes P(above) above 0.5.
+        """
+        mock_fetch.return_value = {"price": 100, "daily_vol": 0.01, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=180)
+        result = analyze_finance("Will Tesla stock be above $98?", end_dt)
+        assert result is not None
+        # Target slightly below current + drift → clearly >50%
+        assert result["estimated_prob"] > 0.55
+
+
+# =========================================================================
+# Audit fix #4: Proportional fees
+# =========================================================================
+
+class TestProportionalFees:
+    """Fees should scale with number of outcomes."""
+
+    def test_binary_arb_fee_is_2pct(self, now):
+        """Binary arb: 2 outcomes → fee = 2% (2 × 2% / 2)."""
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert result["fee_per_100"] == EST_FEE_PCT  # 2.0
+
+    def test_4outcome_arb_fee_is_4pct(self, now):
+        """4-outcome arb: fee = 4% (4 × 2% / 2)."""
+        m = _make_market(
+            now,
+            outcomePrices='["0.82", "0.08", "0.03", "0.02"]',
+            outcomes='["A", "B", "C", "D"]',
+        )
+        result = process_market(m, now)
+        assert result is not None
+        assert result["fee_per_100"] == EST_FEE_PCT * 2  # 4.0
+
+    def test_4outcome_net_accounts_for_higher_fees(self, now):
+        """Multi-outcome arb net should reflect higher fees."""
+        m = _make_market(
+            now,
+            outcomePrices='["0.82", "0.08", "0.03", "0.02"]',
+            outcomes='["A", "B", "C", "D"]',
+        )
+        result = process_market(m, now)
+        assert result is not None
+        assert result["net_per_100"] == round(result["ev_per_100"] - 4.0, 2)
+
+
+# =========================================================================
+# Audit fix #5: Anchored temperature regex
+# =========================================================================
+
+class TestTempRegexAnchored:
+    """Temperature regex should capture the right number."""
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_5day_temp_captures_80_not_5(self, mock_fetch):
+        """'5-day high temperature exceed 80F' → threshold=80, not 5."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries([82, 85, 78, 84, 80, 86, 79, 83])
+        mock_fetch.return_value = entries
+        result = analyze_weather(
+            "Will NYC's 5-day high temperature exceed 80F?", end_dt
+        )
+        assert result is not None
+        # If threshold was 5, prob would be ~1.0. If 80, prob is reasonable.
+        assert "80" in result["analysis"]
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_threshold_after_keyword(self, mock_fetch):
+        """'exceed 75' without unit → captures 75 via keyword regex."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries([72, 74, 76, 78])
+        mock_fetch.return_value = entries
+        result = analyze_weather(
+            "Will the temperature in Miami exceed 75 this week?", end_dt
+        )
+        assert result is not None
+
+
+# =========================================================================
+# Audit fix #7: Extended directional keywords
+# =========================================================================
+
+class TestDirectionalKeywords:
+    """Test extended directional keywords for weather and finance."""
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_finance_decline_is_below(self, mock_fetch):
+        mock_fetch.return_value = {"price": 100, "daily_vol": 0.02, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Tesla stock decline to $50?", end_dt)
+        assert result is not None
+        assert result["estimated_prob"] < 0.1  # very unlikely
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_finance_crash_is_below(self, mock_fetch):
+        mock_fetch.return_value = {"price": 100, "daily_vol": 0.02, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Tesla crash below $50?", end_dt)
+        assert result is not None
+        assert result["estimated_prob"] < 0.1
+
+
+# =========================================================================
+# Audit fix #8 + #18: Spread/slippage warnings
+# =========================================================================
+
+class TestSpreadWarnings:
+    """Test spread and liquidity warnings on arbs."""
+
+    def test_low_liquidity_arb_gets_spread_warning(self, now):
+        """Arb with <$25K liquidity → spread warning."""
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]', liquidity="15000")
+        result = process_market(m, now)
+        assert result is not None
+        assert result["spread_warning"] != ""
+
+    def test_high_liquidity_arb_no_warning(self, now):
+        """Arb with $100K liquidity → no spread warning."""
+        m = _make_market(now, outcomePrices='["0.45", "0.48"]', liquidity="100000")
+        result = process_market(m, now)
+        assert result is not None
+        assert result["spread_warning"] == ""
+
+    def test_multi_outcome_low_per_outcome_warning(self, now):
+        """4-outcome arb with $15K total → per-outcome warning."""
+        m = _make_market(
+            now,
+            outcomePrices='["0.82", "0.08", "0.03", "0.02"]',
+            outcomes='["A", "B", "C", "D"]',
+            liquidity="15000",
+        )
+        result = process_market(m, now)
+        assert result is not None
+        assert "outcome" in result["spread_warning"].lower()
+
+    def test_spread_warning_field_always_present(self, now):
+        """spread_warning should always be in result."""
+        m = _make_market(now)
+        result = process_market(m, now)
+        assert result is not None
+        assert "spread_warning" in result
+
+
+# =========================================================================
+# Audit fix #9: Sports confidence — horizon + bookmakers
+# =========================================================================
+
+class TestSportsConfidenceHybrid:
+    """Sports confidence should combine bookmaker count and time horizon."""
+
+    @patch("polymarket_scanner.ODDS_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_odds")
+    def test_many_books_short_horizon_is_high(self, mock_fetch):
+        """5+ bookmakers, <3 days → high confidence."""
+        mock_fetch.return_value = [{
+            "home_team": "Los Angeles Lakers",
+            "away_team": "Boston Celtics",
+            "bookmakers": [
+                {"markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Los Angeles Lakers", "price": 2.10},
+                    {"name": "Boston Celtics", "price": 1.80},
+                ]}]}
+                for _ in range(5)
+            ],
+        }]
+        end_dt = datetime.now(timezone.utc) + timedelta(days=1)
+        result = analyze_sports("Will the Lakers beat the Celtics in the NBA?", end_dt)
+        assert result is not None
+        assert result["confidence"] == "high"
+
+    @patch("polymarket_scanner.ODDS_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_odds")
+    def test_few_books_far_horizon_is_low(self, mock_fetch):
+        """2 bookmakers, 30+ days → low confidence."""
+        mock_fetch.return_value = [{
+            "home_team": "Los Angeles Lakers",
+            "away_team": "Boston Celtics",
+            "bookmakers": [
+                {"markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Los Angeles Lakers", "price": 2.10},
+                    {"name": "Boston Celtics", "price": 1.80},
+                ]}]}
+                for _ in range(2)
+            ],
+        }]
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_sports("Will the Lakers beat the Celtics in the NBA?", end_dt)
+        assert result is not None
+        assert result["confidence"] == "low"
+
+
+# =========================================================================
+# Audit fix #10: Additional cities
+# =========================================================================
+
+class TestAdditionalCities:
+    """New cities should be recognized."""
+
+    def test_tampa(self):
+        assert _find_city("Weather in Tampa this week") is not None
+
+    def test_charlotte(self):
+        assert _find_city("Temperature in Charlotte") is not None
+
+    def test_orlando(self):
+        assert _find_city("Rain in Orlando?") is not None
+
+    def test_baltimore(self):
+        assert _find_city("Snow in Baltimore") is not None
+
+    def test_kansas_city(self):
+        assert _find_city("Kansas City temperature forecast") is not None
+
+    def test_new_orleans(self):
+        assert _find_city("Will it rain in New Orleans?") is not None
+
+    def test_berlin(self):
+        assert _find_city("Temperature in Berlin above 30C") is not None
+
+    def test_st_louis(self):
+        assert _find_city("Weather in St. Louis") is not None
+
+
+# =========================================================================
+# Audit fix #11: Snow vs rain differentiation
+# =========================================================================
+
+class TestSnowDifferentiation:
+    """Snow questions should use snow-specific logic, not raw PoP."""
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_snow_with_warm_temps_low_prob(self, mock_fetch):
+        """If temperature is warm (>38F), snow prob should be lower than raw PoP."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        # Warm entries with high PoP but no snow weather type
+        entries = []
+        for i in range(8):
+            entries.append({
+                "dt": int((datetime.now(timezone.utc) + timedelta(hours=3 * i)).timestamp()),
+                "main": {"temp": 50, "temp_max": 52, "temp_min": 48},
+                "pop": 0.8,
+                "weather": [{"main": "Rain", "description": "light rain"}],
+            })
+        mock_fetch.return_value = entries
+        result = analyze_weather("Will it snow in Chicago?", end_dt)
+        assert result is not None
+        # Snow prob should be much lower than rain PoP composite (~100%)
+        assert result["estimated_prob"] < 0.3
+
+
+# =========================================================================
+# Audit fix #13: Draw market detection
+# =========================================================================
+
+class TestDrawMarket:
+    """Test _has_draw_market detection."""
+
+    def test_3way_with_draw(self):
+        event = {
+            "bookmakers": [{
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": 2.50},
+                    {"name": "Away", "price": 3.00},
+                    {"name": "Draw", "price": 3.20},
+                ]}]
+            }]
+        }
+        assert _has_draw_market(event) is True
+
+    def test_2way_no_draw(self):
+        event = {
+            "bookmakers": [{
+                "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": 1.90},
+                    {"name": "Away", "price": 2.00},
+                ]}]
+            }]
+        }
+        assert _has_draw_market(event) is False
+
+
+# =========================================================================
+# Audit fix #16: Target date parsing in weather questions
+# =========================================================================
+
+class TestParseTargetDate:
+    """Test specific date extraction from question text."""
+
+    def test_march_5(self):
+        now = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        dt = _parse_target_date("temperature on March 5 in NYC", now)
+        assert dt is not None
+        assert dt.month == 3
+        assert dt.day == 5
+
+    def test_february_28(self):
+        now = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        dt = _parse_target_date("Will it rain February 28?", now)
+        assert dt is not None
+        assert dt.month == 2
+        assert dt.day == 28
+
+    def test_no_date_returns_none(self):
+        now = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        assert _parse_target_date("Will it rain this week?", now) is None
+
+    def test_past_date_wraps_to_next_year(self):
+        now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+        dt = _parse_target_date("temperature on January 10", now)
+        assert dt is not None
+        assert dt.year == 2027
+        assert dt.month == 1
+
+    def test_abbreviated_month(self):
+        now = datetime(2026, 2, 26, 12, 0, tzinfo=timezone.utc)
+        dt = _parse_target_date("Weather on Apr 15", now)
+        assert dt is not None
+        assert dt.month == 4
