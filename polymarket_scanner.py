@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Polymarket Live Opportunity Scanner v3
+Polymarket Live Opportunity Scanner v4
 =======================================
 Full trading intelligence: ROI, annualized returns, mispricing direction,
 multi-outcome support, category filtering, smart scoring.
 
-NEW in v3: Edge informationnel — weather analyzer detects markets where
-external data (forecasts) disagrees with market prices.
+Edge informationnel — 3 analyzers detect markets where external data
+disagrees with market prices:
+  - Weather: OpenWeatherMap forecast vs. temperature/rain markets
+  - Finance: Yahoo Finance price + volatility vs. stock/index threshold markets
+  - Sports:  Bookmaker consensus odds vs. sports outcome markets
 
 Run:  pip install -r requirements.txt && python polymarket_scanner.py
 Open: http://localhost:5000
 
 Optional env vars:
   OPENWEATHERMAP_API_KEY  — free key from openweathermap.org (1000 calls/day)
+  THE_ODDS_API_KEY        — free key from the-odds-api.com (500 requests/month)
 """
 
 import json
@@ -51,6 +55,11 @@ PORT = 5000
 OWM_API_KEY = os.environ.get("OPENWEATHERMAP_API_KEY", "")
 OWM_FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 OWM_CACHE_TTL = 600     # 10 min cache for weather forecasts
+ODDS_API_KEY = os.environ.get("THE_ODDS_API_KEY", "")
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+FINANCE_CACHE_TTL = 300  # 5 min cache for financial data
+ODDS_CACHE_TTL = 300     # 5 min cache for sports odds
 
 # Crypto filter — ONLY unambiguous tokens
 # Removed: sol, eth, ada, link, dot, bnb, matic, ltc (too many false positives)
@@ -297,20 +306,454 @@ def analyze_weather(question: str, end_dt: datetime) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Finance Analyzer — stock/index/commodity edge detection
+# ---------------------------------------------------------------------------
+# Uses Yahoo Finance for current price + historical volatility.
+# Estimates probability via log-normal diffusion model (Black-Scholes style).
+# No API key required.
+
+_finance_cache: dict[str, tuple[float, object]] = {}
+_finance_lock = threading.Lock()
+
+# Map company names / indices / commodities → Yahoo Finance ticker
+FINANCE_TICKERS: dict[str, str] = {
+    # US stocks (top by Polymarket market frequency)
+    "tesla": "TSLA", "tsla": "TSLA",
+    "apple": "AAPL", "aapl": "AAPL",
+    "amazon": "AMZN", "amzn": "AMZN",
+    "google": "GOOGL", "googl": "GOOGL", "alphabet": "GOOGL",
+    "microsoft": "MSFT", "msft": "MSFT",
+    "nvidia": "NVDA", "nvda": "NVDA",
+    "meta": "META", "facebook": "META",
+    "netflix": "NFLX", "nflx": "NFLX",
+    "gamestop": "GME", "gme": "GME",
+    "amd": "AMD",
+    "palantir": "PLTR", "pltr": "PLTR",
+    "coinbase": "COIN",
+    "trump media": "DJT", "djt": "DJT",
+    # Indices
+    "s&p 500": "^GSPC", "s&p": "^GSPC", "spy": "SPY",
+    "nasdaq": "^IXIC", "qqq": "QQQ",
+    "dow jones": "^DJI", "dow": "^DJI",
+    "russell 2000": "^RUT",
+    # Commodities
+    "gold": "GC=F",
+    "oil": "CL=F", "crude oil": "CL=F", "wti": "CL=F",
+    "silver": "SI=F",
+    "natural gas": "NG=F",
+}
+
+_FINANCE_KEYWORDS_RE = re.compile(
+    r"\b(?:stock|share|price|close|trading|"
+    r"s&p|nasdaq|dow|gold|oil|silver|"
+    r"tesla|apple|amazon|google|nvidia|microsoft|meta|netflix|"
+    r"gamestop|palantir|amd)\b",
+    re.IGNORECASE,
+)
+
+# Match $1,234.56 or bare numbers after price-related words
+_PRICE_THRESHOLD_RE = re.compile(
+    r"(?:\$\s*([\d,]+(?:\.\d+)?)|"
+    r"(?:above|over|exceed|reach|hit|below|under|at least)\s+\$?([\d,]+(?:\.\d+)?))",
+    re.IGNORECASE,
+)
+
+
+def _normal_cdf(x: float) -> float:
+    """Standard normal CDF using math.erf."""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _find_ticker(question: str) -> str | None:
+    """Extract Yahoo Finance ticker symbol from question text.
+
+    Returns ticker string or None. Longest match wins.
+    """
+    q_lower = question.lower()
+    best = None
+    best_len = 0
+    for name, ticker in FINANCE_TICKERS.items():
+        if name in q_lower and len(name) > best_len:
+            best = ticker
+            best_len = len(name)
+    return best
+
+
+def _fetch_yahoo_chart(ticker: str) -> dict | None:
+    """Fetch current price + historical volatility from Yahoo Finance.
+
+    Returns {price, daily_vol, ticker} or None.
+    Cache: 5 min TTL per ticker, expired entries purged.
+    """
+    now_ts = _time.time()
+    with _finance_lock:
+        expired = [k for k, (ts, _) in _finance_cache.items()
+                   if now_ts - ts >= FINANCE_CACHE_TTL]
+        for k in expired:
+            del _finance_cache[k]
+        if ticker in _finance_cache:
+            ts, data = _finance_cache[ticker]
+            if now_ts - ts < FINANCE_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(
+            f"{YAHOO_CHART_URL}/{ticker}",
+            params={"range": "3mo", "interval": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        chart = resp.json().get("chart", {}).get("result", [])
+        if not chart:
+            return None
+
+        meta = chart[0].get("meta", {})
+        current_price = meta.get("regularMarketPrice", 0)
+        closes = (chart[0].get("indicators", {})
+                  .get("quote", [{}])[0].get("close", []))
+        closes = [c for c in closes if c is not None and c > 0]
+
+        if len(closes) < 10 or current_price <= 0:
+            return None
+
+        # Daily volatility from log returns (RMS)
+        log_returns = [math.log(closes[i] / closes[i - 1])
+                       for i in range(1, len(closes))
+                       if closes[i - 1] > 0]
+        if not log_returns:
+            return None
+        daily_vol = (sum(r ** 2 for r in log_returns) / len(log_returns)) ** 0.5
+
+        result_data = {"price": current_price, "daily_vol": daily_vol,
+                       "ticker": ticker}
+        with _finance_lock:
+            _finance_cache[ticker] = (_time.time(), result_data)
+        return result_data
+    except Exception:
+        return None
+
+
+def analyze_finance(question: str, end_dt: datetime) -> dict | None:
+    """Analyze financial market question using current price + volatility model.
+
+    Uses log-normal diffusion: P(S_T > K) = Φ(-z) where
+    z = ln(K/S) / (σ√T),  S=current price, K=threshold, T=days, σ=daily vol.
+    No API key required — uses Yahoo Finance public chart endpoint.
+    """
+    if not _FINANCE_KEYWORDS_RE.search(question):
+        return None
+
+    ticker = _find_ticker(question)
+    if not ticker:
+        return None
+
+    # Extract price threshold
+    m = _PRICE_THRESHOLD_RE.search(question)
+    if not m:
+        return None
+    raw_val = m.group(1) or m.group(2)
+    threshold = float(raw_val.replace(",", ""))
+    if threshold <= 0:
+        return None
+
+    quote = _fetch_yahoo_chart(ticker)
+    if not quote:
+        return None
+
+    current = quote["price"]
+    daily_vol = quote["daily_vol"]
+
+    now_dt = datetime.now(timezone.utc)
+    days = max((end_dt - now_dt).total_seconds() / 86400, 0.1)
+
+    # Log-normal probability
+    sigma_period = daily_vol * math.sqrt(days)
+    if sigma_period < 0.001:
+        prob_above = 1.0 if current >= threshold else 0.0
+    else:
+        z = math.log(threshold / current) / sigma_period
+        prob_above = 1.0 - _normal_cdf(z)
+
+    q_lower = question.lower()
+    is_below = any(w in q_lower for w in ["below", "under", "fall", "drop"])
+    prob = (1.0 - prob_above) if is_below else prob_above
+
+    # Confidence: shorter horizon + closer to target = more reliable
+    if days <= 7:
+        confidence = "high"
+    elif days <= 30:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    pct_away = abs(threshold - current) / current * 100
+    direction = "below" if is_below else "above"
+
+    return {
+        "estimated_prob": round(prob, 3),
+        "source": "Yahoo Finance",
+        "analysis": (f"{ticker} @ ${current:,.2f}, target {direction} "
+                     f"${threshold:,.2f} ({pct_away:.1f}% away, {days:.0f}d, "
+                     f"vol {daily_vol*100:.1f}%/d). P={prob*100:.0f}%."),
+        "confidence": confidence,
+        "data_point": f"${current:,.2f} ({ticker})",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sports Analyzer — bookmaker consensus edge detection
+# ---------------------------------------------------------------------------
+# Compares Polymarket sports prices to bookmaker consensus odds via The Odds API.
+# Devigging removes bookmaker margin to get "true" probabilities.
+# Optional: requires THE_ODDS_API_KEY env var (free tier: 500 req/month).
+
+_odds_cache: dict[str, tuple[float, object]] = {}
+_odds_lock = threading.Lock()
+
+# Sport keywords → The Odds API sport keys
+SPORT_KEYS: dict[str, str] = {
+    # Basketball
+    "nba": "basketball_nba",
+    "ncaa basketball": "basketball_ncaab", "march madness": "basketball_ncaab",
+    "wnba": "basketball_wnba",
+    # Football
+    "nfl": "americanfootball_nfl",
+    "super bowl": "americanfootball_nfl_super_bowl",
+    "ncaa football": "americanfootball_ncaaf",
+    "college football": "americanfootball_ncaaf",
+    # Baseball
+    "mlb": "baseball_mlb", "world series": "baseball_mlb",
+    # Hockey
+    "nhl": "icehockey_nhl", "stanley cup": "icehockey_nhl",
+    # Soccer
+    "premier league": "soccer_epl", "epl": "soccer_epl",
+    "champions league": "soccer_uefa_champions_league",
+    "la liga": "soccer_spain_la_liga",
+    "bundesliga": "soccer_germany_bundesliga",
+    "serie a": "soccer_italy_serie_a",
+    "ligue 1": "soccer_france_ligue_one",
+    "mls": "soccer_usa_mls",
+    # Combat
+    "ufc": "mma_mixed_martial_arts", "mma": "mma_mixed_martial_arts",
+    "boxing": "boxing_boxing",
+    # Motorsport
+    "formula 1": "motorsport_formula_one", "f1 ": "motorsport_formula_one",
+}
+
+_SPORTS_DETECT_RE = re.compile(
+    r"\b(?:win|beat|defeat|champion(?:ship)?|final|playoff|match|game|fight|bout|"
+    r"nba|nfl|mlb|nhl|ufc|mma|boxing|premier league|champions league|"
+    r"super bowl|world series|stanley cup|march madness|"
+    r"lakers|celtics|warriors|nets|heat|bucks|sixers|knicks|"
+    r"chiefs|eagles|ravens|49ers|cowboys|bills|dolphins|"
+    r"yankees|dodgers|astros|braves|mets|phillies|"
+    r"oilers|rangers|panthers|bruins|avalanche|"
+    r"real madrid|barcelona|manchester|liverpool|arsenal|chelsea|"
+    r"psg|bayern|juventus|inter milan)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_sport(question: str) -> str | None:
+    """Find The Odds API sport key from question keywords. Longest match wins."""
+    q_lower = question.lower()
+    best = None
+    best_len = 0
+    for keyword, sport_key in SPORT_KEYS.items():
+        if keyword in q_lower and len(keyword) > best_len:
+            best = sport_key
+            best_len = len(keyword)
+    return best
+
+
+def _fetch_odds(sport_key: str) -> list[dict] | None:
+    """Fetch upcoming odds from The Odds API. Cache 5 min, purge expired."""
+    if not ODDS_API_KEY:
+        return None
+    now_ts = _time.time()
+    with _odds_lock:
+        expired = [k for k, (ts, _) in _odds_cache.items()
+                   if now_ts - ts >= ODDS_CACHE_TTL]
+        for k in expired:
+            del _odds_cache[k]
+        if sport_key in _odds_cache:
+            ts, data = _odds_cache[sport_key]
+            if now_ts - ts < ODDS_CACHE_TTL:
+                return data
+
+    try:
+        resp = requests.get(
+            f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+            params={
+                "apiKey": ODDS_API_KEY,
+                "regions": "us,eu",
+                "markets": "h2h",
+                "oddsFormat": "decimal",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        with _odds_lock:
+            _odds_cache[sport_key] = (_time.time(), events)
+        return events
+    except Exception:
+        return None
+
+
+def _match_event(question: str, events: list[dict]) -> dict | None:
+    """Find the event best matching the question by team name overlap.
+
+    Returns event dict or None (requires >= 4 chars matched).
+    """
+    q_lower = question.lower()
+    best = None
+    best_score = 0
+    for event in events:
+        home = event.get("home_team", "").lower()
+        away = event.get("away_team", "").lower()
+        score = 0
+        for team in [home, away]:
+            if team in q_lower:
+                score += len(team)
+            else:
+                for word in team.split():
+                    if len(word) >= 4 and word in q_lower:
+                        score += len(word)
+        if score > best_score:
+            best = event
+            best_score = score
+    return best if best_score >= 4 else None
+
+
+def _find_target_team(question: str, event: dict) -> str:
+    """Determine which team the question is about."""
+    q_lower = question.lower()
+    home = event.get("home_team", "")
+    away = event.get("away_team", "")
+    for team in [home, away]:
+        if team.lower() in q_lower:
+            return team
+        for word in team.lower().split():
+            if len(word) >= 4 and word in q_lower:
+                return team
+    return home  # fallback to home
+
+
+def _consensus_probability(event: dict, team_name: str) -> tuple[float, int]:
+    """Calculate devigged consensus probability for a team.
+
+    Averages implied probability across all bookmakers after removing vig.
+    Returns (probability, num_bookmakers).
+    """
+    probs: list[float] = []
+    team_lower = team_name.lower()
+    for bookmaker in event.get("bookmakers", []):
+        for market in bookmaker.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+            outcomes = market.get("outcomes", [])
+            if len(outcomes) < 2:
+                continue
+            # Find target team's decimal odds
+            target_odds = None
+            other_odds: list[float] = []
+            for out in outcomes:
+                name = out.get("name", "").lower()
+                price = out.get("price", 0)
+                if price <= 1.0:
+                    continue
+                if team_lower in name or name in team_lower:
+                    target_odds = price
+                else:
+                    other_odds.append(price)
+            if target_odds and other_odds:
+                # Devig: remove bookmaker margin
+                raw = 1.0 / target_odds
+                total = raw + sum(1.0 / o for o in other_odds)
+                if total > 0:
+                    probs.append(raw / total)
+    if not probs:
+        return 0.0, 0
+    return sum(probs) / len(probs), len(probs)
+
+
+def analyze_sports(question: str, end_dt: datetime) -> dict | None:
+    """Analyze sports market using bookmaker consensus odds.
+
+    Fetches odds from The Odds API, matches event by team names,
+    calculates devigged consensus probability across bookmakers.
+    Requires THE_ODDS_API_KEY env var.
+    """
+    if not ODDS_API_KEY:
+        return None
+    if not _SPORTS_DETECT_RE.search(question):
+        return None
+
+    sport_key = _find_sport(question)
+    if not sport_key:
+        return None
+
+    events = _fetch_odds(sport_key)
+    if not events:
+        return None
+
+    matched = _match_event(question, events)
+    if not matched:
+        return None
+
+    target = _find_target_team(question, matched)
+    prob, num_books = _consensus_probability(matched, target)
+    if num_books < 2:
+        return None  # need at least 2 bookmakers for consensus
+
+    home = matched.get("home_team", "?")
+    away = matched.get("away_team", "?")
+
+    if num_books >= 5:
+        confidence = "high"
+    elif num_books >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "estimated_prob": round(prob, 3),
+        "source": "The Odds API",
+        "analysis": (f"Consensus {num_books} bookmakers: {target} "
+                     f"@ {prob*100:.0f}%. "
+                     f"Match: {home} vs {away}."),
+        "confidence": confidence,
+        "data_point": f"{prob*100:.0f}% ({num_books} books)",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Analyzer orchestrator
+# ---------------------------------------------------------------------------
+
 def run_analyzers(question: str, end_dt: datetime) -> dict | None:
     """Run all available analyzers on a market question.
 
-    Returns best analysis result or None.
-    Future: add sports odds, finance, etc. here.
+    Returns first positive analysis result or None.
+    Order: weather → finance → sports (deterministic).
     """
-    # Weather
+    # Weather (OpenWeatherMap)
     result = analyze_weather(question, end_dt)
     if result:
         return result
 
-    # Future analyzers go here:
-    # result = analyze_sports(question, end_dt)
-    # result = analyze_finance(question, end_dt)
+    # Finance (Yahoo Finance — no API key needed)
+    result = analyze_finance(question, end_dt)
+    if result:
+        return result
+
+    # Sports (The Odds API — optional key)
+    result = analyze_sports(question, end_dt)
+    if result:
+        return result
 
     return None
 
@@ -1364,30 +1807,51 @@ def api_scan():
 # ---------------------------------------------------------------------------
 
 def _validate_api_keys():
-    """Log status of optional API keys at startup (item 15)."""
+    """Log status of all optional API keys at startup."""
+    # --- OpenWeatherMap ---
     if OWM_API_KEY:
-        print(f"  [OK] OpenWeatherMap API key configured ({OWM_API_KEY[:4]}...)")
-        # Quick validation: test a known city
+        print(f"  [OK] OpenWeatherMap key ({OWM_API_KEY[:4]}...)")
         try:
             resp = requests.get(OWM_FORECAST_URL, params={
                 "lat": 40.71, "lon": -74.01, "appid": OWM_API_KEY,
                 "units": "imperial", "cnt": 1,
             }, timeout=5)
             if resp.status_code == 200:
-                print("  [OK] OpenWeatherMap API key validated")
+                print("       Validated — weather edge active")
             elif resp.status_code == 401:
-                print("  [WARN] OpenWeatherMap API key INVALID (401)")
+                print("       [WARN] Key INVALID (401)")
             else:
-                print(f"  [WARN] OpenWeatherMap API returned {resp.status_code}")
+                print(f"       [WARN] API returned {resp.status_code}")
         except Exception as exc:
-            print(f"  [WARN] OpenWeatherMap API unreachable: {exc}")
+            print(f"       [WARN] API unreachable: {exc}")
     else:
-        print("  [--] No OpenWeatherMap key (set OPENWEATHERMAP_API_KEY for weather edge)")
+        print("  [--] No OpenWeatherMap key (OPENWEATHERMAP_API_KEY)")
+    # --- Yahoo Finance ---
+    print("  [OK] Yahoo Finance — no key needed, always active")
+    # --- The Odds API ---
+    if ODDS_API_KEY:
+        print(f"  [OK] The Odds API key ({ODDS_API_KEY[:4]}...)")
+        try:
+            resp = requests.get(f"{ODDS_API_BASE}/sports", params={
+                "apiKey": ODDS_API_KEY,
+            }, timeout=5)
+            if resp.status_code == 200:
+                sports = resp.json()
+                active = sum(1 for s in sports if s.get("active"))
+                print(f"       Validated — {active} active sports")
+            elif resp.status_code == 401:
+                print("       [WARN] Key INVALID (401)")
+            else:
+                print(f"       [WARN] API returned {resp.status_code}")
+        except Exception as exc:
+            print(f"       [WARN] API unreachable: {exc}")
+    else:
+        print("  [--] No Odds API key (THE_ODDS_API_KEY for sports edge)")
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Polymarket Live Opportunity Scanner v3")
+    print("  Polymarket Live Opportunity Scanner v4")
     print("  http://localhost:5000")
     print("=" * 60)
     _validate_api_keys()

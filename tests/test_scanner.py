@@ -28,12 +28,21 @@ from unittest.mock import patch
 from polymarket_scanner import (
     CITY_COORDS,
     EST_FEE_PCT,
+    FINANCE_TICKERS,
     MAX_ANN_ROI,
     MIN_EDGE,
     MIN_LIQUIDITY,
+    SPORT_KEYS,
+    _consensus_probability,
     _find_city,
+    _find_sport,
+    _find_ticker,
     _horizon_confidence,
+    _match_event,
+    _normal_cdf,
     _to_fahrenheit,
+    analyze_finance,
+    analyze_sports,
     analyze_weather,
     classify,
     compute_score,
@@ -1253,3 +1262,395 @@ class TestOWMCachePurge:
         # Cleanup
         with ps._owm_lock:
             ps._owm_cache.clear()
+
+
+# =========================================================================
+# Finance Analyzer — ticker detection, probability model
+# =========================================================================
+
+class TestNormalCdf:
+    """Test standard normal CDF helper."""
+
+    def test_cdf_at_zero(self):
+        assert abs(_normal_cdf(0) - 0.5) < 0.001
+
+    def test_cdf_large_positive(self):
+        assert _normal_cdf(3.0) > 0.998
+
+    def test_cdf_large_negative(self):
+        assert _normal_cdf(-3.0) < 0.002
+
+    def test_cdf_symmetry(self):
+        assert abs(_normal_cdf(1.0) + _normal_cdf(-1.0) - 1.0) < 0.001
+
+
+class TestFindTicker:
+    """Test financial ticker extraction from question text."""
+
+    def test_find_tesla(self):
+        assert _find_ticker("Will Tesla stock reach $400?") == "TSLA"
+
+    def test_find_tsla(self):
+        assert _find_ticker("TSLA above $300 by March?") == "TSLA"
+
+    def test_find_sp500(self):
+        assert _find_ticker("Will the S&P 500 close above 6000?") == "^GSPC"
+
+    def test_find_gold(self):
+        assert _find_ticker("Gold price above $2500?") == "GC=F"
+
+    def test_find_nvidia(self):
+        assert _find_ticker("Will Nvidia stock hit $200?") == "NVDA"
+
+    def test_longest_match_wins(self):
+        """'s&p 500' should match over 's&p'."""
+        assert _find_ticker("S&P 500 reaching new highs") == "^GSPC"
+
+    def test_no_match(self):
+        assert _find_ticker("Will Trump win the election?") is None
+
+    def test_case_insensitive(self):
+        assert _find_ticker("will TESLA reach $500?") == "TSLA"
+
+
+class TestAnalyzeFinance:
+    """Test finance analyzer with mocked Yahoo Finance data."""
+
+    def _mock_yahoo_response(self, current_price, closes):
+        """Build a mock Yahoo Finance chart response."""
+        return {
+            "chart": {
+                "result": [{
+                    "meta": {"regularMarketPrice": current_price},
+                    "indicators": {
+                        "quote": [{"close": closes}]
+                    },
+                }]
+            }
+        }
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_stock_above_current_high_prob(self, mock_fetch):
+        """Stock at $350, target $300 → high probability."""
+        mock_fetch.return_value = {"price": 350, "daily_vol": 0.02, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Tesla stock be above $300?", end_dt)
+        assert result is not None
+        assert result["source"] == "Yahoo Finance"
+        assert result["estimated_prob"] > 0.7
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_stock_above_far_away_low_prob(self, mock_fetch):
+        """Stock at $200, target $500, low vol → low probability."""
+        mock_fetch.return_value = {"price": 200, "daily_vol": 0.01, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Tesla stock reach $500?", end_dt)
+        assert result is not None
+        assert result["estimated_prob"] < 0.1
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_stock_below_threshold(self, mock_fetch):
+        """'below' question inverts probability."""
+        mock_fetch.return_value = {"price": 100, "daily_vol": 0.02, "ticker": "^GSPC"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will S&P 500 drop below $50?", end_dt)
+        assert result is not None
+        # Price at 100, target below 50 → very unlikely
+        assert result["estimated_prob"] < 0.1
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_dollar_sign_threshold(self, mock_fetch):
+        """Threshold with $ sign parsed correctly."""
+        mock_fetch.return_value = {"price": 2400, "daily_vol": 0.01, "ticker": "GC=F"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Gold price above $2,500?", end_dt)
+        assert result is not None
+        assert "2,500" in result["analysis"] or "2500" in result["analysis"]
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_confidence_short_horizon(self, mock_fetch):
+        """Short-term market → high confidence."""
+        mock_fetch.return_value = {"price": 300, "daily_vol": 0.02, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=3)
+        result = analyze_finance("Will Tesla hit $310?", end_dt)
+        assert result is not None
+        assert result["confidence"] == "high"
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_confidence_long_horizon(self, mock_fetch):
+        """Long-term market → low confidence."""
+        mock_fetch.return_value = {"price": 300, "daily_vol": 0.02, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=45)
+        result = analyze_finance("Will Tesla hit $310?", end_dt)
+        assert result is not None
+        assert result["confidence"] == "low"
+
+    def test_non_finance_question_returns_none(self):
+        """Non-finance question → None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Trump win the election?", end_dt)
+        assert result is None
+
+    def test_no_threshold_returns_none(self):
+        """Finance keyword but no price threshold → None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Tesla stock go up?", end_dt)
+        assert result is None
+
+    @patch("polymarket_scanner._fetch_yahoo_chart")
+    def test_ev_realistic_for_close_price(self, mock_fetch):
+        """Price near threshold → ~50% probability."""
+        mock_fetch.return_value = {"price": 300, "daily_vol": 0.02, "ticker": "TSLA"}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=30)
+        result = analyze_finance("Will Tesla reach $300?", end_dt)
+        assert result is not None
+        assert 0.3 < result["estimated_prob"] < 0.7
+
+
+# =========================================================================
+# Sports Analyzer — sport detection, team matching, odds consensus
+# =========================================================================
+
+class TestFindSport:
+    """Test sport key detection from question text."""
+
+    def test_nba(self):
+        assert _find_sport("Will the Lakers win the NBA championship?") == "basketball_nba"
+
+    def test_nfl(self):
+        assert _find_sport("NFL regular season MVP?") == "americanfootball_nfl"
+
+    def test_super_bowl_specific(self):
+        """'super bowl' is more specific than 'nfl'."""
+        assert _find_sport("Who wins Super Bowl LIX?") == "americanfootball_nfl_super_bowl"
+
+    def test_premier_league(self):
+        assert _find_sport("Premier League title race") == "soccer_epl"
+
+    def test_ufc(self):
+        assert _find_sport("UFC heavyweight bout") == "mma_mixed_martial_arts"
+
+    def test_no_sport(self):
+        assert _find_sport("Will the bill pass the Senate?") is None
+
+
+class TestMatchEvent:
+    """Test event matching by team name overlap."""
+
+    def test_match_by_full_name(self):
+        events = [
+            {"home_team": "Los Angeles Lakers", "away_team": "Boston Celtics"},
+            {"home_team": "Golden State Warriors", "away_team": "Miami Heat"},
+        ]
+        result = _match_event("Will the Lakers beat the Celtics?", events)
+        assert result is not None
+        assert result["home_team"] == "Los Angeles Lakers"
+
+    def test_match_by_partial_name(self):
+        events = [
+            {"home_team": "Los Angeles Lakers", "away_team": "Boston Celtics"},
+        ]
+        result = _match_event("Lakers championship odds?", events)
+        assert result is not None
+        assert result["home_team"] == "Los Angeles Lakers"
+
+    def test_no_match_short_words(self):
+        """Short words (< 4 chars) don't trigger false matches."""
+        events = [
+            {"home_team": "FC Red Bull Salzburg", "away_team": "AC Milan"},
+        ]
+        result = _match_event("Will AI change the world?", events)
+        assert result is None
+
+    def test_no_match_empty(self):
+        assert _match_event("Lakers vs Celtics", []) is None
+
+
+class TestConsensusProb:
+    """Test devigged consensus probability calculation."""
+
+    def test_two_bookmakers(self):
+        """Average devigged probability from two bookmakers."""
+        event = {
+            "bookmakers": [
+                {"markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Lakers", "price": 2.0},
+                    {"name": "Celtics", "price": 1.9},
+                ]}]},
+                {"markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Lakers", "price": 2.1},
+                    {"name": "Celtics", "price": 1.85},
+                ]}]},
+            ]
+        }
+        prob, count = _consensus_probability(event, "Lakers")
+        assert count == 2
+        assert 0.4 < prob < 0.55  # ~47-49% devigged
+
+    def test_no_matching_team(self):
+        """Team not found in outcomes → (0, 0)."""
+        event = {
+            "bookmakers": [
+                {"markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Team A", "price": 2.0},
+                    {"name": "Team B", "price": 1.9},
+                ]}]},
+            ]
+        }
+        prob, count = _consensus_probability(event, "Lakers")
+        assert count == 0
+        assert prob == 0.0
+
+    def test_devig_removes_margin(self):
+        """Devigged probabilities should sum to ~1.0 (not >1.0 like raw)."""
+        event = {
+            "bookmakers": [
+                {"markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": 1.90},
+                    {"name": "Away", "price": 2.00},
+                ]}]},
+            ]
+        }
+        prob_home, _ = _consensus_probability(event, "Home")
+        prob_away, _ = _consensus_probability(event, "Away")
+        assert abs(prob_home + prob_away - 1.0) < 0.01
+
+
+class TestAnalyzeSports:
+    """Test sports analyzer with mocked Odds API responses."""
+
+    def test_no_api_key_returns_none(self):
+        """Without API key → None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_sports("Will the Lakers win the NBA title?", end_dt)
+        assert result is None
+
+    def test_non_sports_question_returns_none(self):
+        """Non-sports question → None."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=7)
+        with patch("polymarket_scanner.ODDS_API_KEY", "fake-key"):
+            result = analyze_sports("Will Trump win the election?", end_dt)
+        assert result is None
+
+    @patch("polymarket_scanner.ODDS_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_odds")
+    def test_nba_game_detected(self, mock_fetch):
+        """NBA question with matching event → analysis returned."""
+        mock_fetch.return_value = [
+            {
+                "home_team": "Los Angeles Lakers",
+                "away_team": "Boston Celtics",
+                "bookmakers": [
+                    {"markets": [{"key": "h2h", "outcomes": [
+                        {"name": "Los Angeles Lakers", "price": 2.10},
+                        {"name": "Boston Celtics", "price": 1.80},
+                    ]}]},
+                    {"markets": [{"key": "h2h", "outcomes": [
+                        {"name": "Los Angeles Lakers", "price": 2.05},
+                        {"name": "Boston Celtics", "price": 1.85},
+                    ]}]},
+                    {"markets": [{"key": "h2h", "outcomes": [
+                        {"name": "Los Angeles Lakers", "price": 2.15},
+                        {"name": "Boston Celtics", "price": 1.78},
+                    ]}]},
+                ],
+            }
+        ]
+        end_dt = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_sports("Will the Lakers beat the Celtics in the NBA?", end_dt)
+        assert result is not None
+        assert result["source"] == "The Odds API"
+        # Lakers ~47% underdog across bookmakers
+        assert 0.35 < result["estimated_prob"] < 0.55
+        assert "Lakers" in result["analysis"]
+        assert result["confidence"] == "medium"  # 3 bookmakers
+
+    @patch("polymarket_scanner.ODDS_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_odds")
+    def test_no_matching_event(self, mock_fetch):
+        """Sports question but no matching event → None."""
+        mock_fetch.return_value = [
+            {
+                "home_team": "Denver Nuggets",
+                "away_team": "Miami Heat",
+                "bookmakers": [],
+            }
+        ]
+        end_dt = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_sports("Will the Lakers win the NBA title?", end_dt)
+        assert result is None
+
+    @patch("polymarket_scanner.ODDS_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_odds")
+    def test_insufficient_bookmakers(self, mock_fetch):
+        """Only 1 bookmaker → None (need >= 2 for consensus)."""
+        mock_fetch.return_value = [
+            {
+                "home_team": "Los Angeles Lakers",
+                "away_team": "Boston Celtics",
+                "bookmakers": [
+                    {"markets": [{"key": "h2h", "outcomes": [
+                        {"name": "Los Angeles Lakers", "price": 2.10},
+                        {"name": "Boston Celtics", "price": 1.80},
+                    ]}]},
+                ],
+            }
+        ]
+        end_dt = datetime.now(timezone.utc) + timedelta(days=7)
+        result = analyze_sports("Will the Lakers beat the Celtics in the NBA?", end_dt)
+        assert result is None
+
+
+# =========================================================================
+# run_analyzers() — full pipeline with all 3 analyzers
+# =========================================================================
+
+class TestRunAnalyzers:
+    """Test that run_analyzers chains weather → finance → sports."""
+
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_weather_takes_priority(self, mock_w, mock_f, mock_s):
+        """Weather result returned first if available."""
+        mock_w.return_value = {"source": "OpenWeatherMap", "estimated_prob": 0.9}
+        mock_f.return_value = {"source": "Yahoo Finance", "estimated_prob": 0.5}
+        mock_s.return_value = None
+        end_dt = datetime.now(timezone.utc) + timedelta(days=5)
+        result = run_analyzers("test", end_dt)
+        assert result["source"] == "OpenWeatherMap"
+
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_finance_when_no_weather(self, mock_w, mock_f, mock_s):
+        """Finance used when weather returns None."""
+        mock_w.return_value = None
+        mock_f.return_value = {"source": "Yahoo Finance", "estimated_prob": 0.5}
+        mock_s.return_value = None
+        end_dt = datetime.now(timezone.utc) + timedelta(days=5)
+        result = run_analyzers("test", end_dt)
+        assert result["source"] == "Yahoo Finance"
+
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_sports_when_no_weather_or_finance(self, mock_w, mock_f, mock_s):
+        """Sports used as last resort."""
+        mock_w.return_value = None
+        mock_f.return_value = None
+        mock_s.return_value = {"source": "The Odds API", "estimated_prob": 0.6}
+        end_dt = datetime.now(timezone.utc) + timedelta(days=5)
+        result = run_analyzers("test", end_dt)
+        assert result["source"] == "The Odds API"
+
+    @patch("polymarket_scanner.analyze_sports")
+    @patch("polymarket_scanner.analyze_finance")
+    @patch("polymarket_scanner.analyze_weather")
+    def test_none_when_all_fail(self, mock_w, mock_f, mock_s):
+        """None returned when no analyzer matches."""
+        mock_w.return_value = None
+        mock_f.return_value = None
+        mock_s.return_value = None
+        end_dt = datetime.now(timezone.utc) + timedelta(days=5)
+        assert run_analyzers("test", end_dt) is None

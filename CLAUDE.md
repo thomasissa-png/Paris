@@ -15,7 +15,7 @@ Single-file Flask web app (`polymarket_scanner.py`) that scans Polymarket predic
 
 ## Scoring Philosophy — EV-First + Edge Informationnel
 The scanner prioritizes **real mathematical edge** over raw probability:
-- **Edge informationnel** = external data (weather, etc.) disagrees with market → top priority
+- **Edge informationnel** = external data (weather, finance, sports) disagrees with market → top priority
 - **Arbitrage (sum < 1.0)** = guaranteed profit, no luck involved → always ranked high
 - **Near-certain (>90%)** = high probability but EV ≈ $0 on a fairly priced market → shown with risk warning
 - **Overround (sum > 1.0)** = market margin, NOT an opportunity → excluded
@@ -57,7 +57,7 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 - **Warning**: `⚠ N trades requis` for arbs (execution risk)
 
 ## External Analyzers (Edge Informationnel)
-The scanner can call external APIs to detect informational edge. Analyzers are **optional** — they activate only when the corresponding API key is set as an environment variable.
+The scanner runs 3 analyzers to detect informational edge. Analyzers are **optional** — weather and sports activate with API keys, finance is always active (no key needed).
 
 ### Weather Analyzer
 - **API**: OpenWeatherMap 5-day/3h forecast (free tier: 1000 calls/day)
@@ -70,13 +70,34 @@ The scanner can call external APIs to detect informational edge. Analyzers are *
 - **Temperature**: sigmoid calibration `P = 1/(1+exp(-margin/3))` where margin = max_forecast - threshold
 - **Rain**: composite formula `P(at least one) = 1 - ∏(1 - pop_i)` — not max(PoP)
 - **Confidence**: degrades by forecast horizon (J+1 = high, J+2-3 = medium, J+4-5 = low)
+
+### Finance Analyzer
+- **API**: Yahoo Finance public chart endpoint (no API key needed — always active)
+- **Detects**: stock price threshold markets ("Will Tesla reach $X?"), index targets, commodity prices
+- **Tickers**: 20+ pre-mapped US stocks, indices (S&P, Nasdaq, Dow), commodities (gold, oil, silver)
+- **Model**: Log-normal diffusion `P(S>K) = Φ(-z)` where `z = ln(K/S) / (σ√T)` — Black-Scholes style
+- **Volatility**: calculated from 3-month daily log returns (RMS)
+- **Cache**: 5 min TTL per ticker, expired entries purged automatically, thread-safe
+- **Confidence**: 0-7d = high, 7-30d = medium, 30d+ = low
+
+### Sports Analyzer
+- **API**: The Odds API v4 (free tier: 500 requests/month)
+- **Env var**: `THE_ODDS_API_KEY`
+- **Startup validation**: API key tested at startup, counts active sports
+- **Detects**: sports outcome markets (NBA, NFL, MLB, NHL, UFC, soccer leagues, F1, etc.)
+- **Sports**: 20+ sport keys covering major US + international leagues
+- **Team matching**: keyword overlap between Polymarket question and event teams (min 4-char match)
+- **Probability**: devigged consensus across multiple bookmakers (raw_prob / overround)
+- **Minimum**: requires >= 2 bookmakers for reliable consensus
+- **Cache**: 5 min TTL per sport, expired entries purged automatically, thread-safe
+
+### Common Edge Properties
 - **Edge calc**: `estimated_prob - yes_price` (binary: float_prices[0]) → if |edge| > 10%, classified as "edge" tier
 - **EV formula**: `(win_prob / buy_price - 1) × 100` where win_prob = est_prob (buy Yes) or 1-est_prob (buy No)
-- **Analyzers run in process_market()**: call order is documented, weather first, future analyzers appended
+- **Analyzer call order**: weather → finance → sports (deterministic, first match wins)
 
 ### Future Analyzers (architecture ready)
-- **Sports**: The Odds API — compare bookmaker consensus to Polymarket prices
-- **Finance**: Yahoo Finance — "Will stock X reach price Y?" with current price + volatility
+- **Polls**: Polling aggregators — election/political probability vs. Polymarket
 - **Resolution**: News APIs — detect already-resolved markets not yet settled
 
 ## Key Design Decisions
@@ -87,8 +108,11 @@ The scanner can call external APIs to detect informational edge. Analyzers are *
 - **Fees estimated at ~2%**: arb profit shown net of estimated fees
 - **External analyzers optional**: zero-config without API keys, enhanced with keys via env vars
 - **Weather cache**: 10 min TTL per city, thread-safe, auto-purge expired entries, prevents API key exhaustion
-- **Analyzer call order**: analyzers run inside `process_market()` via `run_analyzers()` — weather first, future analyzers appended. Order is deterministic and documented
-- **OWM calls synchronous**: acceptable because cache deduplicates requests (10 min TTL). Async would add complexity for minimal gain at current scale
+- **Finance cache**: 5 min TTL per ticker, same purge pattern
+- **Odds cache**: 5 min TTL per sport, same purge pattern
+- **Analyzer call order**: weather → finance → sports via `run_analyzers()`. Order is deterministic and documented
+- **All API calls synchronous**: acceptable because caches deduplicate requests. Async would add complexity for minimal gain at current scale
+- **Finance always active**: Yahoo Finance needs no key — every scan checks stock/index markets for free
 
 ## Testing
 **ALWAYS run tests before committing**:
@@ -96,15 +120,18 @@ The scanner can call external APIs to detect informational edge. Analyzers are *
 python -m pytest tests/ -v
 ```
 
-Test file: `tests/test_scanner.py` (160 tests) — covers:
+Test file: `tests/test_scanner.py` (203 tests) — covers:
 - classify(): arb tiers (super/interesting), edge tier (before 0.995), near-certain watch-only, overround excluded, boundaries
 - compute_score(): edge > arb >> near-certain, time/liquidity weighting, confidence multiplier
 - Weather analyzer: city detection, sigmoid temp, composite rain, flexible keywords, horizon confidence, mocked OWM API
+- Finance analyzer: ticker detection, log-normal probability model, threshold parsing, above/below direction, confidence by horizon
+- Sports analyzer: sport detection, event matching by team names, devigged consensus probability, bookmaker count, mocked Odds API
+- run_analyzers(): priority chain (weather → finance → sports), fallback behavior
 - Edge pipeline: Yes price comparison, positive/negative edge trade recs, EV formula, confidence scoring
 - Crypto regex: 10 true positives + 10 false-positive guards
 - Category extraction: 8 categories + tag priority + fallback
 - process_market() pipeline: arb detection + EV + fees + net, near-certain risk, ROI cap, volume 24h filter, thin detection, multi-outcome arb labels, all filters, edge cases
-- Cleanup: "la" alias removed, OWM cache purge
+- Cleanup: "la" alias removed, OWM cache purge, normal CDF helper
 
 ## File Structure
 ```
