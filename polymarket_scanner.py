@@ -93,6 +93,14 @@ ANOMALY_MIN_VOLUME = 5000           # minimum volume to consider for anomalies
 ANOMALY_MIN_LIQUIDITY = 2000        # minimum liquidity to consider
 ANOMALY_PRICE_FIDELITY = 60         # 1h granularity for price history
 ANOMALY_PRICE_INTERVAL = "1d"       # fetch last 24h of price data
+ANOMALY_REVERSAL_THRESHOLD = 40.0   # >40% of spike retraced = reversal (pump&dump)
+ANOMALY_SPREAD_SPIKE_MULT = 3.0     # spread > 3× normal = market maker flight
+ANOMALY_DEPTH_DROP_PCT = 60.0       # bid depth drops >60% = depth collapse
+ANOMALY_CONVERGENCE_BONUS = 1.5     # severity multiplier when 3+ signals converge
+ANOMALY_OFF_HOURS_START = 2         # UTC hour — suspicious window start
+ANOMALY_OFF_HOURS_END = 6           # UTC hour — suspicious window end
+ANOMALY_PERSISTENCE_DECAY = 0.8     # decay factor per scan for persistence tracking
+ANOMALY_PERSISTENCE_BOOST = 2.0     # severity boost for repeated anomalies
 
 # --- Notifications ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -2068,6 +2076,9 @@ _anomaly_price_cache: dict[str, tuple[float, list]] = {}
 _anomaly_price_lock = threading.Lock()
 _anomaly_results_cache: list[dict] = []  # last scan's anomalies
 _anomaly_results_lock = threading.Lock()
+# Persistence: track anomaly severity across scans {market_id: score}
+_anomaly_persistence: dict[str, float] = {}
+_anomaly_persistence_lock = threading.Lock()
 
 
 def _fetch_order_book(token_id: str) -> dict | None:
@@ -2205,33 +2216,42 @@ def _fetch_price_history(token_id: str) -> list[dict]:
 
 def _detect_volume_spike(volume: float, volume_24h: float,
                          start_date_str: str | None,
-                         created_at_str: str | None) -> dict | None:
+                         created_at_str: str | None,
+                         volume_1wk: float = 0.0) -> dict | None:
     """Detect abnormal volume spike: 24h volume vs historical daily average.
 
-    Returns anomaly dict or None.
+    Prefers volume_1wk/7 as daily baseline (more recent, more accurate).
+    Falls back to volume/days_active if weekly data unavailable.
     """
     if volume_24h <= 0 or volume <= 0:
         return None
-    # Estimate days active from startDate or createdAt
-    days_active = 30.0  # conservative default
-    for ds in (start_date_str, created_at_str):
-        dt = parse_date(ds)
-        if dt:
-            delta = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
-            if delta > 0:
-                days_active = max(delta, 1.0)
-                break
-    daily_avg = volume / days_active
+
+    # Best baseline: weekly volume / 7 (most recent, avoids dead-market skew)
+    if volume_1wk > 0:
+        daily_avg = volume_1wk / 7.0
+    else:
+        # Fallback: estimate days active from startDate or createdAt
+        days_active = 30.0  # conservative default
+        for ds in (start_date_str, created_at_str):
+            dt = parse_date(ds)
+            if dt:
+                delta = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+                if delta > 0:
+                    days_active = max(delta, 1.0)
+                    break
+        daily_avg = volume / days_active
+
     if daily_avg <= 0:
         return None
     ratio = volume_24h / daily_avg
     if ratio >= ANOMALY_VOL_SPIKE_THRESHOLD:
+        src = "moy. hebdo" if volume_1wk > 0 else "moy. historique"
         return {
             "type": "volume_spike",
             "severity": min(ratio / ANOMALY_VOL_SPIKE_THRESHOLD, 10.0),
             "label": "Volume Anormal",
             "description": (f"Volume 24h ${volume_24h:,.0f} = "
-                            f"{ratio:.1f}× la moyenne journalière "
+                            f"{ratio:.1f}× la {src} "
                             f"(${daily_avg:,.0f}/j)"),
             "ratio": round(ratio, 1),
             "volume_24h": volume_24h,
@@ -2337,12 +2357,322 @@ def _detect_volume_liquidity_imbalance(volume_24h: float,
     return None
 
 
+def _detect_price_reversal(history: list[dict]) -> dict | None:
+    """Detect pump-and-dump / insider reversal pattern.
+
+    Classic insider pattern: price spikes sharply then retraces >40%
+    of the move. Signals informed trading followed by profit-taking.
+    """
+    if len(history) < 4:
+        return None
+
+    # Find the peak and trough within the history
+    prices = [pt["p"] for pt in history]
+    first_p = prices[0]
+    max_p = max(prices)
+    min_p = min(prices)
+    last_p = prices[-1]
+    max_idx = prices.index(max_p)
+    min_idx = prices.index(min_p)
+
+    # Check upward spike then reversal (pump & dump)
+    if max_idx > 0 and max_idx < len(prices) - 1:
+        spike_up = max_p - first_p
+        if first_p > 0 and spike_up > 0:
+            retrace = max_p - last_p
+            retrace_pct = (retrace / spike_up) * 100
+            spike_pct = (spike_up / first_p) * 100
+            if (retrace_pct >= ANOMALY_REVERSAL_THRESHOLD
+                    and spike_pct >= ANOMALY_PRICE_JUMP_PCT):
+                return {
+                    "type": "reversal",
+                    "severity": min(
+                        (retrace_pct / ANOMALY_REVERSAL_THRESHOLD)
+                        * (spike_pct / ANOMALY_PRICE_JUMP_PCT), 10.0),
+                    "label": "Pump & Dump",
+                    "description": (
+                        f"Spike {first_p * 100:.0f}% → {max_p * 100:.0f}% "
+                        f"puis retour à {last_p * 100:.0f}% "
+                        f"(retrace {retrace_pct:.0f}% du mouvement)"),
+                    "spike_pct": round(spike_pct, 1),
+                    "retrace_pct": round(retrace_pct, 1),
+                    "peak_price": round(max_p, 4),
+                    "current_price": round(last_p, 4),
+                }
+
+    # Check downward spike then reversal (dump & pump)
+    if min_idx > 0 and min_idx < len(prices) - 1:
+        spike_down = first_p - min_p
+        if first_p > 0 and spike_down > 0:
+            retrace = last_p - min_p
+            retrace_pct = (retrace / spike_down) * 100
+            spike_pct = (spike_down / first_p) * 100
+            if (retrace_pct >= ANOMALY_REVERSAL_THRESHOLD
+                    and spike_pct >= ANOMALY_PRICE_JUMP_PCT):
+                return {
+                    "type": "reversal",
+                    "severity": min(
+                        (retrace_pct / ANOMALY_REVERSAL_THRESHOLD)
+                        * (spike_pct / ANOMALY_PRICE_JUMP_PCT), 10.0),
+                    "label": "Dump & Pump",
+                    "description": (
+                        f"Crash {first_p * 100:.0f}% → {min_p * 100:.0f}% "
+                        f"puis rebond à {last_p * 100:.0f}% "
+                        f"(retrace {retrace_pct:.0f}% du mouvement)"),
+                    "spike_pct": round(spike_pct, 1),
+                    "retrace_pct": round(retrace_pct, 1),
+                    "trough_price": round(min_p, 4),
+                    "current_price": round(last_p, 4),
+                }
+
+    return None
+
+
+def _detect_book_anomaly(market: dict) -> dict | None:
+    """Detect order book anomalies: depth collapse or spread spike.
+
+    When market makers pull orders (depth collapse) or widen spreads,
+    it signals they have information the market hasn't priced in yet.
+    Uses the existing _fetch_order_book() infrastructure.
+    """
+    clob_ids_raw = market.get("clobTokenIds", "[]")
+    try:
+        clob_ids = json.loads(clob_ids_raw) if isinstance(
+            clob_ids_raw, str) else clob_ids_raw
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not clob_ids or not isinstance(clob_ids, list) or len(clob_ids) < 1:
+        return None
+
+    # Check all outcomes for book anomalies
+    worst_spread_pct = 0.0
+    min_depth = float("inf")
+    total_depth = 0.0
+    books_checked = 0
+
+    for tid in clob_ids[:4]:  # max 4 outcomes
+        book = _fetch_order_book(tid)
+        if not book:
+            continue
+        books_checked += 1
+        spread_pct = book.get("spread_pct", 0)
+        bid_depth = book.get("bid_depth", 0)
+        ask_depth = book.get("ask_depth", 0)
+        depth = bid_depth + ask_depth
+        total_depth += depth
+        if depth < min_depth:
+            min_depth = depth
+        if spread_pct > worst_spread_pct:
+            worst_spread_pct = spread_pct
+
+    if books_checked == 0:
+        return None
+
+    avg_depth = total_depth / books_checked
+
+    # Spread spike: >15% spread suggests market maker uncertainty
+    if worst_spread_pct >= 15.0:
+        sev = min(worst_spread_pct / 5.0, 10.0)
+        return {
+            "type": "book_anomaly",
+            "severity": sev,
+            "label": "Spread Anormal",
+            "description": (
+                f"Spread bid-ask {worst_spread_pct:.1f}% — "
+                f"les market makers élargissent (incertitude / fuite)"),
+            "spread_pct": round(worst_spread_pct, 1),
+            "avg_depth": round(avg_depth, 0),
+        }
+
+    # Depth collapse: very low depth relative to liquidity
+    if avg_depth < 50 and books_checked > 0:
+        sev = min((50 - avg_depth) / 5.0, 10.0)
+        return {
+            "type": "book_anomaly",
+            "severity": max(sev, 2.0),
+            "label": "Carnet Vidé",
+            "description": (
+                f"Profondeur moyenne {avg_depth:.0f} unités — "
+                f"les market makers ont retiré leurs ordres"),
+            "spread_pct": round(worst_spread_pct, 1),
+            "avg_depth": round(avg_depth, 0),
+        }
+
+    return None
+
+
+def _detect_off_hours_activity(history: list[dict]) -> dict | None:
+    """Detect significant price movement during off-hours (2-6 AM UTC).
+
+    Insider trading often happens when fewer eyes are watching.
+    Large moves during off-hours are statistically more suspicious.
+    """
+    if len(history) < 3:
+        return None
+
+    off_hour_moves = []
+    for i in range(1, len(history)):
+        t = history[i]["t"]
+        # Convert Unix timestamp to UTC hour
+        try:
+            hour = datetime.fromtimestamp(t, tz=timezone.utc).hour
+        except (OSError, ValueError, OverflowError):
+            continue
+        if ANOMALY_OFF_HOURS_START <= hour < ANOMALY_OFF_HOURS_END:
+            p_prev = history[i - 1]["p"]
+            p_curr = history[i]["p"]
+            if p_prev > 0:
+                move_pct = abs(p_curr - p_prev) / p_prev * 100
+                if move_pct >= 5.0:  # significant move during off-hours
+                    off_hour_moves.append({
+                        "hour": hour, "move_pct": move_pct,
+                        "from": p_prev, "to": p_curr,
+                    })
+
+    if not off_hour_moves:
+        return None
+
+    biggest = max(off_hour_moves, key=lambda x: x["move_pct"])
+    sev = min(biggest["move_pct"] / 5.0, 10.0)
+    direction = "hausse" if biggest["to"] > biggest["from"] else "baisse"
+
+    return {
+        "type": "off_hours",
+        "severity": sev,
+        "label": "Activité Nocturne",
+        "description": (
+            f"Mouvement de {biggest['move_pct']:.0f}% à {biggest['hour']}h UTC "
+            f"({biggest['from'] * 100:.0f}% → {biggest['to'] * 100:.0f}%, "
+            f"{direction}) — horaire suspect"),
+        "move_pct": round(biggest["move_pct"], 1),
+        "hour": biggest["hour"],
+        "moves_count": len(off_hour_moves),
+    }
+
+
+def _compute_trade_direction(anomalies: list[dict],
+                             price_history: list[dict],
+                             float_prices: list[float]) -> dict:
+    """Infer probable trade direction from anomaly signals.
+
+    Returns {direction: "yes"|"no"|"unknown", confidence: float,
+             reasoning: str}.
+    """
+    yes_signals = 0
+    no_signals = 0
+
+    for a in anomalies:
+        atype = a.get("type", "")
+        if atype == "price_jump":
+            if a.get("price_to", 0) > a.get("price_from", 0):
+                yes_signals += 2  # big buy pressure on Yes
+            else:
+                no_signals += 2
+        elif atype == "price_velocity":
+            if a.get("price_end", 0) > a.get("price_start", 0):
+                yes_signals += 2
+            else:
+                no_signals += 2
+        elif atype == "reversal":
+            # Reversal = insiders already exited, opposite direction
+            if "Pump" in a.get("label", ""):
+                no_signals += 3  # after pump & dump → go No
+            else:
+                yes_signals += 3
+        elif atype == "off_hours":
+            # Follow the off-hours direction (insiders move first)
+            if a.get("move_pct", 0) > 0:
+                # Check direction from description
+                desc = a.get("description", "")
+                if "hausse" in desc:
+                    yes_signals += 1
+                elif "baisse" in desc:
+                    no_signals += 1
+
+    # Use last price momentum if available
+    if price_history and len(price_history) >= 2:
+        last_p = price_history[-1]["p"]
+        prev_p = price_history[-3]["p"] if len(price_history) >= 3 else price_history[0]["p"]
+        if last_p > prev_p:
+            yes_signals += 1
+        elif last_p < prev_p:
+            no_signals += 1
+
+    total = yes_signals + no_signals
+    if total == 0:
+        return {"direction": "unknown", "confidence": 0.0,
+                "reasoning": "Signaux insuffisants"}
+
+    if yes_signals > no_signals:
+        conf = yes_signals / total
+        return {
+            "direction": "yes",
+            "confidence": round(conf, 2),
+            "reasoning": f"Pression acheteuse Yes ({yes_signals} vs {no_signals} signaux)",
+        }
+    elif no_signals > yes_signals:
+        conf = no_signals / total
+        return {
+            "direction": "no",
+            "confidence": round(conf, 2),
+            "reasoning": f"Pression acheteuse No ({no_signals} vs {yes_signals} signaux)",
+        }
+    return {"direction": "unknown", "confidence": 0.5,
+            "reasoning": "Signaux contradictoires (volume sans direction claire)"}
+
+
+def _apply_convergence_boost(anomalies: list[dict]) -> float:
+    """Apply severity boost when multiple signal types converge.
+
+    3+ different signal types = high confidence anomaly.
+    Returns the boost multiplier.
+    """
+    types = set(a["type"] for a in anomalies)
+    if len(types) >= 4:
+        return ANOMALY_CONVERGENCE_BONUS * 1.3  # extreme convergence
+    if len(types) >= 3:
+        return ANOMALY_CONVERGENCE_BONUS
+    if len(types) >= 2:
+        return 1.2  # mild boost
+    return 1.0
+
+
+def _get_persistence_score(market_id: str) -> float:
+    """Get persistence score for a market (how many scans it's been flagged).
+
+    Higher = more consistently anomalous = more suspicious.
+    """
+    with _anomaly_persistence_lock:
+        return _anomaly_persistence.get(market_id, 0.0)
+
+
+def _update_persistence(anomaly_ids: set[str], all_anomalies: dict[str, float]):
+    """Update persistence tracking after a scan.
+
+    Decay old entries, boost current ones.
+    """
+    with _anomaly_persistence_lock:
+        # Decay all existing entries
+        to_delete = []
+        for mid in _anomaly_persistence:
+            _anomaly_persistence[mid] *= ANOMALY_PERSISTENCE_DECAY
+            if _anomaly_persistence[mid] < 0.1:
+                to_delete.append(mid)
+        for mid in to_delete:
+            del _anomaly_persistence[mid]
+        # Boost current anomalies
+        for mid, severity in all_anomalies.items():
+            current = _anomaly_persistence.get(mid, 0.0)
+            _anomaly_persistence[mid] = current + severity
+
+
 def detect_anomalies(market: dict, now: datetime) -> dict | None:
     """Run all anomaly detectors on a market.
 
     Returns an anomaly report dict or None if no anomalies found.
-    Anomaly report contains: market info + list of detected anomalies
-    with severity scores.
+    8 detectors: volume spike, V/L imbalance, price jump, velocity,
+    reversal (pump&dump), order book, off-hours, + convergence scoring.
     """
     question = market.get("question", "") or market.get("title", "")
     slug = market.get("slug", "")
@@ -2352,6 +2682,7 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
         market.get("volume24hr") or market.get("volume24Hr")
         or market.get("volume_24h") or 0
     )
+    volume_1wk = parse_float(market.get("volume1wk") or 0)
     liquidity = parse_float(market.get("liquidity"))
 
     # --- Basic gates ---
@@ -2381,10 +2712,11 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
     # --- Collect anomalies ---
     anomalies: list[dict] = []
 
-    # 1) Volume spike
+    # 1) Volume spike (uses volume1wk when available)
     vol_anom = _detect_volume_spike(
         volume, volume_24h,
         market.get("startDate"), market.get("createdAt"),
+        volume_1wk=volume_1wk,
     )
     if vol_anom:
         anomalies.append(vol_anom)
@@ -2394,7 +2726,12 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
     if vl_anom:
         anomalies.append(vl_anom)
 
-    # 3) Price-based anomalies (require CLOB price history)
+    # 3) Order book anomalies (spread spike / depth collapse)
+    book_anom = _detect_book_anomaly(market)
+    if book_anom:
+        anomalies.append(book_anom)
+
+    # 4) Price-based anomalies (require CLOB price history)
     clob_ids_raw = market.get("clobTokenIds", "[]")
     try:
         clob_ids = json.loads(clob_ids_raw) if isinstance(
@@ -2402,28 +2739,61 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
     except (json.JSONDecodeError, TypeError):
         clob_ids = []
 
-    price_history = []
-    if clob_ids and isinstance(clob_ids, list) and len(clob_ids) > 0:
-        # Fetch history for the first outcome (Yes / top outcome)
-        price_history = _fetch_price_history(clob_ids[0])
+    # Fetch price history for BOTH outcomes (Yes AND No)
+    all_histories: list[list[dict]] = []
+    if clob_ids and isinstance(clob_ids, list):
+        for tid in clob_ids[:2]:  # Yes and No tokens
+            h = _fetch_price_history(tid)
+            all_histories.append(h)
 
-    if price_history:
-        # 3a) Price jump detection
-        jump_anom = _detect_price_jumps(price_history)
+    # Analyze each outcome's price history
+    for hist in all_histories:
+        if not hist:
+            continue
+        # 4a) Price jump detection
+        jump_anom = _detect_price_jumps(hist)
         if jump_anom:
-            anomalies.append(jump_anom)
+            # Avoid duplicate price_jump if already found
+            if not any(a["type"] == "price_jump" and
+                       a.get("jump_pct", 0) >= jump_anom.get("jump_pct", 0)
+                       for a in anomalies):
+                anomalies.append(jump_anom)
 
-        # 3b) Price velocity
-        vel_anom = _detect_price_velocity(price_history)
+        # 4b) Price velocity
+        vel_anom = _detect_price_velocity(hist)
         if vel_anom:
-            anomalies.append(vel_anom)
+            if not any(a["type"] == "price_velocity" and
+                       a.get("velocity_pct", 0) >= vel_anom.get("velocity_pct", 0)
+                       for a in anomalies):
+                anomalies.append(vel_anom)
+
+        # 4c) Reversal / pump-and-dump detection
+        rev_anom = _detect_price_reversal(hist)
+        if rev_anom:
+            anomalies.append(rev_anom)
+
+        # 4d) Off-hours activity
+        off_anom = _detect_off_hours_activity(hist)
+        if off_anom:
+            anomalies.append(off_anom)
 
     if not anomalies:
         return None
 
-    # --- Build anomaly report ---
-    # Compute composite severity (max of individual severities)
-    max_severity = max(a["severity"] for a in anomalies)
+    # --- Convergence boost (multiple signal types = higher confidence) ---
+    convergence_mult = _apply_convergence_boost(anomalies)
+
+    # --- Composite severity ---
+    raw_max_severity = max(a["severity"] for a in anomalies)
+    # Persistence boost
+    market_id = condition_id or slug or question[:40]
+    persistence_score = _get_persistence_score(market_id)
+    persistence_mult = 1.0
+    if persistence_score >= 2.0:
+        persistence_mult = min(1.0 + persistence_score * 0.2, ANOMALY_PERSISTENCE_BOOST)
+
+    max_severity = min(raw_max_severity * convergence_mult * persistence_mult, 10.0)
+
     # Severity label
     if max_severity >= 7.0:
         severity_label = "critique"
@@ -2444,8 +2814,17 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
         delta_s = (end_dt - now).total_seconds()
         days_left = max(delta_s / 86400.0, 0)
 
+    # Primary price history for chart (Yes token)
+    price_history = all_histories[0] if all_histories else []
+
+    # Trade direction inference
+    trade_dir = _compute_trade_direction(anomalies, price_history, float_prices)
+
+    # Convergence info
+    signal_types = sorted(set(a["type"] for a in anomalies))
+
     return {
-        "id": condition_id or slug or question[:40],
+        "id": market_id,
         "question": question,
         "slug": slug,
         "url": f"https://polymarket.com/event/{slug}" if slug else "",
@@ -2459,8 +2838,13 @@ def detect_anomalies(market: dict, now: datetime) -> dict | None:
         "anomalies": anomalies,
         "anomaly_count": len(anomalies),
         "max_severity": round(max_severity, 1),
+        "raw_severity": round(raw_max_severity, 1),
         "severity_label": severity_label,
         "severity_class": severity_class,
+        "convergence_mult": round(convergence_mult, 2),
+        "persistence_score": round(persistence_score, 1),
+        "signal_types": signal_types,
+        "trade_direction": trade_dir,
         "price_history": price_history[-24:] if price_history else [],
         "detected_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
@@ -3289,6 +3673,13 @@ def scan() -> dict:
         anomalies_list.sort(key=lambda x: -x["max_severity"])
         # Keep top 50 to avoid bloating response
         anomalies_list = anomalies_list[:50]
+        # Update persistence tracking
+        anomaly_severities = {
+            a["id"]: a["max_severity"] for a in anomalies_list
+        }
+        _update_persistence(
+            set(anomaly_severities.keys()), anomaly_severities
+        )
         _record_health("anomaly", True,
                        f"{len(anomalies_list)} anomalies detected")
     except Exception as exc:
@@ -3911,14 +4302,34 @@ function renderMiniChart(history){
 function renderAnomalyCard(item){
   var link=item.url?'<a href="'+esc(item.url)+'" target="_blank" rel="noopener">'+esc(item.question)+'</a>':esc(item.question);
 
-  /* severity badge */
+  /* severity badge + convergence */
   var sevCls='severity-'+item.severity_class;
   var bdg='<span class="anomaly-severity '+sevCls+'">'+esc(item.severity_label)+' ('+item.max_severity.toFixed(1)+')</span>';
+  if(item.convergence_mult&&item.convergence_mult>1.0){
+    bdg+='<span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(255,59,48,0.2);color:#ff3b30">'+item.signal_types.length+' SIGNAUX</span>';
+  }
+  if(item.persistence_score&&item.persistence_score>=2.0){
+    bdg+='<span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(155,109,255,0.2);color:#9b6dff">RECURRENT</span>';
+  }
   if(item.days_left!==undefined){
     var dl=item.days_left;
     var dlTxt=dl<1?(dl*24).toFixed(1)+'h':Math.round(dl)+'d';
     var urg=dl<=7;
     bdg+='<span class="card-countdown '+(urg?'cd-urgent':'cd-normal')+'">'+dlTxt+'</span>';
+  }
+
+  /* trade direction recommendation */
+  var dirHtml='';
+  if(item.trade_direction&&item.trade_direction.direction!=='unknown'){
+    var td=item.trade_direction;
+    var dirCls=td.direction==='yes'?'anomaly-price-yes':'anomaly-price-no';
+    var dirLabel=td.direction==='yes'?'ACHETER YES':'ACHETER NO';
+    var confPct=Math.round(td.confidence*100);
+    dirHtml='<div style="padding:8px 10px;background:var(--pm-bg-surface);border-radius:var(--r-md);border:1px solid rgba(255,59,48,0.2);display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+      +'<span style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:4px" class="'+dirCls+'">'+dirLabel+'</span>'
+      +'<span style="font-size:11px;color:var(--pm-text-secondary)">Confiance '+confPct+'%</span>'
+      +'<span style="font-size:10px;color:var(--pm-text-tertiary);flex:1">'+esc(td.reasoning)+'</span>'
+      +'</div>';
   }
 
   /* prices */
@@ -3954,6 +4365,7 @@ function renderAnomalyCard(item){
 
   return '<div class="anomaly-card" data-category="'+esc(item.category)+'" data-id="'+esc(item.id)+'">'
     +'<div class="card-top"><div class="card-question">'+link+'</div><div class="card-badges">'+bdg+'</div></div>'
+    +dirHtml
     +prHtml
     +chartHtml
     +sigHtml

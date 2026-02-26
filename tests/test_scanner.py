@@ -3348,10 +3348,19 @@ from polymarket_scanner import (
     ANOMALY_VL_RATIO_THRESHOLD,
     ANOMALY_MIN_VOLUME,
     ANOMALY_MIN_LIQUIDITY,
+    ANOMALY_REVERSAL_THRESHOLD,
+    ANOMALY_CONVERGENCE_BONUS,
     _detect_volume_spike,
     _detect_price_jumps,
     _detect_price_velocity,
     _detect_volume_liquidity_imbalance,
+    _detect_price_reversal,
+    _detect_book_anomaly,
+    _detect_off_hours_activity,
+    _compute_trade_direction,
+    _apply_convergence_boost,
+    _get_persistence_score,
+    _update_persistence,
     _fetch_price_history,
     detect_anomalies,
 )
@@ -3745,3 +3754,370 @@ class TestFetchPriceHistory:
         _fetch_price_history("token_cache")
         _fetch_price_history("token_cache")
         assert mock_get.call_count == 1  # only one API call
+
+
+# =========================================================================
+# Anomaly Detection v2 — New Detectors
+# =========================================================================
+
+
+class TestPriceReversal:
+    """Test pump-and-dump / reversal detection."""
+
+    def test_pump_and_dump_detected(self):
+        """Price spikes up then retraces -> reversal detected."""
+        history = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.55},
+            {"t": 3000, "p": 0.75},  # peak (50% spike)
+            {"t": 4000, "p": 0.60},  # retrace 60% of spike
+            {"t": 5000, "p": 0.55},
+        ]
+        result = _detect_price_reversal(history)
+        assert result is not None
+        assert result["type"] == "reversal"
+        assert "Pump" in result["label"] or "Dump" in result["label"]
+
+    def test_dump_and_pump_detected(self):
+        """Price crashes then recovers -> reversal detected."""
+        history = [
+            {"t": 1000, "p": 0.70},
+            {"t": 2000, "p": 0.65},
+            {"t": 3000, "p": 0.50},  # trough (28.5% crash)
+            {"t": 4000, "p": 0.60},  # recovery 50% of crash
+            {"t": 5000, "p": 0.65},
+        ]
+        result = _detect_price_reversal(history)
+        assert result is not None
+        assert result["type"] == "reversal"
+
+    def test_no_reversal_on_sustained_move(self):
+        """Price moves up and stays -> not a reversal."""
+        history = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.60},
+            {"t": 3000, "p": 0.70},
+            {"t": 4000, "p": 0.72},
+            {"t": 5000, "p": 0.73},
+        ]
+        result = _detect_price_reversal(history)
+        assert result is None
+
+    def test_too_few_points(self):
+        """Less than 4 points -> no reversal."""
+        assert _detect_price_reversal([
+            {"t": 1, "p": 0.5}, {"t": 2, "p": 0.7}, {"t": 3, "p": 0.5}
+        ]) is None
+
+    def test_small_spike_ignored(self):
+        """Spike below ANOMALY_PRICE_JUMP_PCT -> ignored even with retrace."""
+        history = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.52},  # 4% spike (below 10% threshold)
+            {"t": 3000, "p": 0.54},
+            {"t": 4000, "p": 0.51},
+            {"t": 5000, "p": 0.50},
+        ]
+        result = _detect_price_reversal(history)
+        assert result is None
+
+
+class TestBookAnomaly:
+    """Test order book anomaly detection."""
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_wide_spread_detected(self, mock_book):
+        """Very wide spread -> anomaly detected."""
+        mock_book.return_value = {
+            "best_bid": 0.30, "best_ask": 0.55,
+            "spread": 0.25, "spread_pct": 45.0,
+            "bid_depth": 100.0, "ask_depth": 100.0,
+        }
+        market = {"clobTokenIds": '["tok1"]'}
+        result = _detect_book_anomaly(market)
+        assert result is not None
+        assert result["type"] == "book_anomaly"
+        assert "Spread" in result["label"]
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_depth_collapse_detected(self, mock_book):
+        """Very low depth -> anomaly detected."""
+        mock_book.return_value = {
+            "best_bid": 0.49, "best_ask": 0.51,
+            "spread": 0.02, "spread_pct": 3.9,
+            "bid_depth": 10.0, "ask_depth": 15.0,
+        }
+        market = {"clobTokenIds": '["tok1"]'}
+        result = _detect_book_anomaly(market)
+        assert result is not None
+        assert result["type"] == "book_anomaly"
+        assert "Carnet" in result["label"] or "depth" in result.get("description", "").lower()
+
+    @patch("polymarket_scanner._fetch_order_book")
+    def test_healthy_book_no_anomaly(self, mock_book):
+        """Normal spread and depth -> no anomaly."""
+        mock_book.return_value = {
+            "best_bid": 0.49, "best_ask": 0.51,
+            "spread": 0.02, "spread_pct": 4.0,
+            "bid_depth": 500.0, "ask_depth": 500.0,
+        }
+        market = {"clobTokenIds": '["tok1"]'}
+        result = _detect_book_anomaly(market)
+        assert result is None
+
+    def test_no_clob_ids_returns_none(self):
+        """No clobTokenIds -> None."""
+        result = _detect_book_anomaly({"clobTokenIds": "[]"})
+        assert result is None
+
+
+class TestOffHoursActivity:
+    """Test off-hours (2-6 AM UTC) activity detection."""
+
+    def test_off_hours_move_detected(self):
+        """Large move at 3 AM UTC -> detected."""
+        base_ts = 1709168400  # some timestamp
+        # Create history where one move is at 3 AM UTC
+        h3am = datetime(2026, 2, 26, 3, 0, tzinfo=timezone.utc)
+        h2am = datetime(2026, 2, 26, 2, 0, tzinfo=timezone.utc)
+        history = [
+            {"t": int(h2am.timestamp()), "p": 0.50},
+            {"t": int(h3am.timestamp()), "p": 0.60},  # 20% move at 3am
+            {"t": int(h3am.timestamp()) + 3600, "p": 0.62},
+        ]
+        result = _detect_off_hours_activity(history)
+        assert result is not None
+        assert result["type"] == "off_hours"
+        assert "Nocturne" in result["label"]
+
+    def test_daytime_move_not_flagged(self):
+        """Large move at 2 PM UTC -> NOT detected."""
+        h14 = datetime(2026, 2, 26, 14, 0, tzinfo=timezone.utc)
+        h15 = datetime(2026, 2, 26, 15, 0, tzinfo=timezone.utc)
+        history = [
+            {"t": int(h14.timestamp()), "p": 0.50},
+            {"t": int(h15.timestamp()), "p": 0.60},  # 20% move at 2pm
+            {"t": int(h15.timestamp()) + 3600, "p": 0.62},
+        ]
+        result = _detect_off_hours_activity(history)
+        assert result is None
+
+    def test_small_off_hours_move_ignored(self):
+        """Small move (<5%) at 3 AM -> ignored."""
+        h3am = datetime(2026, 2, 26, 3, 0, tzinfo=timezone.utc)
+        h2am = datetime(2026, 2, 26, 2, 0, tzinfo=timezone.utc)
+        history = [
+            {"t": int(h2am.timestamp()), "p": 0.50},
+            {"t": int(h3am.timestamp()), "p": 0.52},  # 4% (below 5%)
+            {"t": int(h3am.timestamp()) + 3600, "p": 0.52},
+        ]
+        result = _detect_off_hours_activity(history)
+        assert result is None
+
+
+class TestTradeDirection:
+    """Test trade direction inference."""
+
+    def test_upward_jump_suggests_yes(self):
+        """Price jump upward -> suggest buy Yes."""
+        anomalies = [{"type": "price_jump", "price_from": 0.50, "price_to": 0.70}]
+        result = _compute_trade_direction(anomalies, [], [0.70, 0.30])
+        assert result["direction"] == "yes"
+
+    def test_downward_jump_suggests_no(self):
+        """Price jump downward -> suggest buy No."""
+        anomalies = [{"type": "price_jump", "price_from": 0.70, "price_to": 0.50}]
+        result = _compute_trade_direction(anomalies, [], [0.50, 0.50])
+        assert result["direction"] == "no"
+
+    def test_pump_dump_reversal_suggests_no(self):
+        """After pump & dump -> suggest opposite (No)."""
+        anomalies = [{"type": "reversal", "label": "Pump & Dump"}]
+        result = _compute_trade_direction(anomalies, [], [0.55, 0.45])
+        assert result["direction"] == "no"
+
+    def test_no_signals_unknown(self):
+        """No directional signals -> unknown."""
+        anomalies = [{"type": "volume_spike"}]
+        result = _compute_trade_direction(anomalies, [], [0.50, 0.50])
+        assert result["direction"] == "unknown"
+
+    def test_confidence_calculation(self):
+        """Confidence should be between 0 and 1."""
+        anomalies = [
+            {"type": "price_jump", "price_from": 0.50, "price_to": 0.70},
+            {"type": "price_velocity", "price_start": 0.50, "price_end": 0.70},
+        ]
+        result = _compute_trade_direction(anomalies, [], [0.70, 0.30])
+        assert 0 < result["confidence"] <= 1.0
+
+
+class TestConvergenceBoost:
+    """Test multi-signal convergence scoring."""
+
+    def test_single_type_no_boost(self):
+        """One signal type -> no boost."""
+        anomalies = [{"type": "volume_spike", "severity": 5.0}]
+        assert _apply_convergence_boost(anomalies) == 1.0
+
+    def test_two_types_mild_boost(self):
+        """Two different types -> 1.2x boost."""
+        anomalies = [
+            {"type": "volume_spike", "severity": 5.0},
+            {"type": "price_jump", "severity": 3.0},
+        ]
+        assert _apply_convergence_boost(anomalies) == 1.2
+
+    def test_three_types_full_boost(self):
+        """Three different types -> CONVERGENCE_BONUS boost."""
+        anomalies = [
+            {"type": "volume_spike", "severity": 5.0},
+            {"type": "price_jump", "severity": 3.0},
+            {"type": "vl_imbalance", "severity": 4.0},
+        ]
+        result = _apply_convergence_boost(anomalies)
+        assert result == ANOMALY_CONVERGENCE_BONUS
+
+    def test_four_types_extreme_boost(self):
+        """Four+ types -> extreme convergence boost."""
+        anomalies = [
+            {"type": "volume_spike", "severity": 5.0},
+            {"type": "price_jump", "severity": 3.0},
+            {"type": "vl_imbalance", "severity": 4.0},
+            {"type": "reversal", "severity": 6.0},
+        ]
+        result = _apply_convergence_boost(anomalies)
+        assert result > ANOMALY_CONVERGENCE_BONUS
+
+
+class TestPersistence:
+    """Test anomaly persistence tracking across scans."""
+
+    def test_update_and_get(self):
+        """Persistence score increases with repeated detections."""
+        from polymarket_scanner import _anomaly_persistence, _anomaly_persistence_lock
+        with _anomaly_persistence_lock:
+            _anomaly_persistence.clear()
+        _update_persistence({"mkt1"}, {"mkt1": 5.0})
+        score = _get_persistence_score("mkt1")
+        assert score > 0
+
+    def test_decay_on_absence(self):
+        """Score decays when market not flagged."""
+        from polymarket_scanner import _anomaly_persistence, _anomaly_persistence_lock
+        with _anomaly_persistence_lock:
+            _anomaly_persistence.clear()
+            _anomaly_persistence["mkt_decay"] = 5.0
+        # Update without mkt_decay -> it decays
+        _update_persistence({"other"}, {"other": 3.0})
+        score = _get_persistence_score("mkt_decay")
+        assert score < 5.0  # decayed
+
+    def test_accumulation(self):
+        """Repeated flagging accumulates score."""
+        from polymarket_scanner import _anomaly_persistence, _anomaly_persistence_lock
+        with _anomaly_persistence_lock:
+            _anomaly_persistence.clear()
+        _update_persistence({"mkt_acc"}, {"mkt_acc": 3.0})
+        _update_persistence({"mkt_acc"}, {"mkt_acc": 3.0})
+        score = _get_persistence_score("mkt_acc")
+        assert score > 3.0  # accumulated
+
+    def test_unknown_market_returns_zero(self):
+        """Unknown market -> persistence 0."""
+        assert _get_persistence_score("nonexistent_mkt_xyz") == 0.0
+
+
+class TestVolumeSpikev2:
+    """Test volume spike with volume1wk support."""
+
+    def test_uses_volume_1wk_when_available(self):
+        """Prefers volume_1wk/7 as daily baseline."""
+        # Weekly volume = 7000 -> daily avg = 1000
+        # 24h vol = 6000 -> 6x spike
+        result = _detect_volume_spike(100000, 6000, None, None, volume_1wk=7000)
+        assert result is not None
+        assert result["ratio"] >= 5.0
+        assert "hebdo" in result["description"]
+
+    def test_falls_back_without_volume_1wk(self):
+        """Without volume1wk, uses volume/days fallback."""
+        result = _detect_volume_spike(30000, 6000, None, None, volume_1wk=0)
+        assert result is not None
+        assert "historique" in result["description"]
+
+
+class TestDetectAnomaliesV2:
+    """Test enhanced detect_anomalies with new features."""
+
+    @pytest.fixture
+    def now(self):
+        return datetime.now(timezone.utc)
+
+    def _make_anomaly_market(self, now, **overrides):
+        start = (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        base = {
+            "question": "Will X happen by March?",
+            "slug": "will-x-happen",
+            "conditionId": "cond_anomaly_v2",
+            "endDate": (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "startDate": start,
+            "volume": "50000",
+            "volume24hr": "30000",
+            "liquidity": "10000",
+            "outcomePrices": '["0.60", "0.40"]',
+            "outcomes": '["Yes", "No"]',
+            "clobTokenIds": '["token_abc", "token_def"]',
+        }
+        base.update(overrides)
+        return base
+
+    def test_trade_direction_in_output(self, now):
+        """Output includes trade_direction field."""
+        m = self._make_anomaly_market(now)
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert "trade_direction" in result
+        assert "direction" in result["trade_direction"]
+
+    def test_convergence_mult_in_output(self, now):
+        """Output includes convergence_mult field."""
+        m = self._make_anomaly_market(now)
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert "convergence_mult" in result
+
+    def test_signal_types_in_output(self, now):
+        """Output includes signal_types list."""
+        m = self._make_anomaly_market(now)
+        result = detect_anomalies(m, now)
+        assert result is not None
+        assert "signal_types" in result
+        assert isinstance(result["signal_types"], list)
+
+    def test_uses_volume1wk(self, now):
+        """Uses volume1wk field when available."""
+        m = self._make_anomaly_market(now, volume1wk="7000", volume24hr="40000")
+        result = detect_anomalies(m, now)
+        assert result is not None
+        # With weekly vol of 7000, daily avg = 1000, 24h = 40000 -> 40x spike
+        vol_anomalies = [a for a in result["anomalies"] if a["type"] == "volume_spike"]
+        assert len(vol_anomalies) > 0
+
+    @patch("polymarket_scanner._fetch_price_history")
+    def test_reversal_detected_in_pipeline(self, mock_fetch, now):
+        """Reversal detected through full pipeline."""
+        mock_fetch.return_value = [
+            {"t": 1000, "p": 0.50},
+            {"t": 2000, "p": 0.55},
+            {"t": 3000, "p": 0.75},  # peak
+            {"t": 4000, "p": 0.60},
+            {"t": 5000, "p": 0.53},  # retrace
+        ]
+        m = self._make_anomaly_market(
+            now, volume="50000", volume24hr="1000", liquidity="50000"
+        )
+        result = detect_anomalies(m, now)
+        assert result is not None
+        types = [a["type"] for a in result["anomalies"]]
+        assert "reversal" in types
