@@ -1,13 +1,21 @@
 """
-Polymarket Scanner — Test Suite v3
+Polymarket Scanner — Test Suite v4
 ===================================
 Run: python -m pytest tests/ -v
 
 EV-first philosophy, no luck:
 - Arb garanti (sum < 1.0, >2%) = super/interesting, guaranteed profit
+- Edge informationnel (ext data diverges >10%) = edge tier, real EV
 - Near-certain (>90%) = watch only, EV ~$0, involves luck
 - Overround (sum > 1.0) = excluded entirely
 - Arb <2% = excluded (unprofitable after ~2% fees)
+
+v4 changes (16 audit items):
+- Sigmoid temp calibration, composite rain P(at least one)
+- Edge uses Yes price (not max_price), EV = win_prob/buy_price - 1
+- Confidence degradation by forecast horizon
+- Edge checked before 0.995 filter in classify
+- Score multiplied by confidence factor
 """
 
 import json
@@ -24,6 +32,7 @@ from polymarket_scanner import (
     MIN_EDGE,
     MIN_LIQUIDITY,
     _find_city,
+    _horizon_confidence,
     _to_fahrenheit,
     analyze_weather,
     classify,
@@ -61,6 +70,21 @@ def _make_market(now, **overrides):
     }
     base.update(overrides)
     return base
+
+
+def _make_owm_entries(temps, pops=None, base_dt=None):
+    """Create mock OWM forecast entries."""
+    if base_dt is None:
+        base_dt = datetime.now(timezone.utc)
+    entries = []
+    for i, temp in enumerate(temps):
+        entry = {
+            "dt": int((base_dt + timedelta(hours=3 * i)).timestamp()),
+            "main": {"temp": temp, "temp_max": temp + 2, "temp_min": temp - 2},
+            "pop": pops[i] if pops else 0.0,
+        }
+        entries.append(entry)
+    return entries
 
 
 # =========================================================================
@@ -133,7 +157,7 @@ class TestClassify:
         tier, _, _ = classify(0.90, 0.0, 1.0)
         assert tier is None
 
-    # --- Too certain ---
+    # --- Too certain (without edge) ---
 
     def test_too_certain_filtered(self):
         tier, _, _ = classify(0.998, 0.005, 1.0)
@@ -164,7 +188,54 @@ class TestClassify:
         assert rtype == "arbitrage"
 
     def test_too_certain_overrides_arb(self):
+        """0.997 with no edge → filtered."""
         tier, _, _ = classify(0.997, 0.003, 0.998)
+        assert tier is None
+
+
+# =========================================================================
+# classify() with edge_analysis
+# =========================================================================
+
+class TestClassifyEdge:
+    """Test that edge_analysis triggers the 'edge' tier."""
+
+    def test_edge_above_min_edge(self):
+        """Edge >= MIN_EDGE → edge tier."""
+        ea = {"edge": 0.15, "source": "OpenWeatherMap"}
+        tier, label, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
+        assert "OpenWeatherMap" in label
+
+    def test_edge_below_min_edge(self):
+        """Edge < MIN_EDGE → falls through to normal classify."""
+        ea = {"edge": 0.05, "source": "OpenWeatherMap"}
+        tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier is None  # 70% = not near_certain, not arb
+
+    def test_edge_negative_large(self):
+        """Negative edge (market overprices) → still triggers if abs >= MIN_EDGE."""
+        ea = {"edge": -0.20, "source": "OpenWeatherMap"}
+        tier, _, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
+
+    def test_edge_none_no_effect(self):
+        """No edge_analysis → normal behavior."""
+        tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=None)
+        assert tier is None
+
+    def test_edge_on_very_certain_market(self):
+        """Item 6: 0.996 WITH edge → edge tier (edge checked before 0.995 filter)."""
+        ea = {"edge": 0.20, "source": "Test"}
+        tier, _, rtype = classify(0.996, 0.0, 1.0, edge_analysis=ea)
+        assert tier == "edge"
+        assert rtype == "edge"
+
+    def test_very_certain_without_edge_still_filtered(self):
+        """0.996 without edge → still filtered."""
+        tier, _, _ = classify(0.996, 0.0, 1.0, edge_analysis=None)
         assert tier is None
 
 
@@ -213,6 +284,43 @@ class TestComputeScore:
         s_nc = compute_score(0.0, 1.0, 0.94, 5, 50000)
         s_arb = compute_score(0.03, 0.97, 0.50, 5, 50000)
         assert s_arb > s_nc * 5
+
+
+# =========================================================================
+# compute_score() with ext_edge + confidence
+# =========================================================================
+
+class TestComputeScoreEdge:
+
+    def test_edge_scores_higher_than_near_certain(self):
+        s_edge = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20)
+        s_nc = compute_score(0.0, 1.0, 0.94, 5, 50000, ext_edge=0.0)
+        assert s_edge > s_nc * 5
+
+    def test_edge_scores_comparable_to_arbs(self):
+        s_edge = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20)
+        s_arb = compute_score(0.05, 0.95, 0.50, 5, 50000, ext_edge=0.0)
+        assert s_edge > 0
+        assert s_arb > 0
+
+    def test_high_confidence_scores_higher_than_low(self):
+        """Item 16: high confidence edge should score higher than low."""
+        s_high = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20, confidence="high")
+        s_low = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20, confidence="low")
+        assert s_high > s_low
+
+    def test_medium_confidence_between_high_and_low(self):
+        """Medium confidence should score between high and low."""
+        s_high = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20, confidence="high")
+        s_med = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20, confidence="medium")
+        s_low = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20, confidence="low")
+        assert s_high > s_med > s_low
+
+    def test_confidence_does_not_affect_arbs(self):
+        """Confidence only affects ext_edge scoring, not arbs."""
+        s1 = compute_score(0.05, 0.95, 0.50, 5, 50000, ext_edge=0.0, confidence="high")
+        s2 = compute_score(0.05, 0.95, 0.50, 5, 50000, ext_edge=0.0, confidence="low")
+        assert s1 == s2
 
 
 # =========================================================================
@@ -703,6 +811,130 @@ class TestProcessMarket:
 
 
 # =========================================================================
+# process_market() — Edge markets (items 1-2, 11)
+# =========================================================================
+
+class TestProcessMarketEdge:
+    """Test edge market processing with correct price/EV calculations."""
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_uses_yes_price_binary(self, mock_analyzers, now):
+        """Item 1: edge = est_prob - yes_price (not max_price)."""
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.80,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "high",
+            "data_point": "test",
+        }
+        # Binary market: Yes=0.60, No=0.40
+        m = _make_market(now, outcomePrices='["0.60", "0.40"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert result["tier"] == "edge"
+        # Edge should be 0.80 - 0.60 = 0.20 (using Yes price, not max_price)
+        assert abs(result["edge_analysis"]["edge"] - 0.20) < 0.01
+        assert result["edge_analysis"]["market_price"] == 0.60
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_positive_buys_yes(self, mock_analyzers, now):
+        """Item 2: positive edge → BUY YES."""
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.80,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "high",
+            "data_point": "test",
+        }
+        m = _make_market(now, outcomePrices='["0.60", "0.40"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert "YES" in result["trade_label"]
+        assert result["trade_side_class"] == "yes"
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_negative_buys_no(self, mock_analyzers, now):
+        """Item 2: negative edge → BUY NO."""
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.30,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "high",
+            "data_point": "test",
+        }
+        # Binary: Yes=0.60, No=0.40. Edge = 0.30 - 0.60 = -0.30
+        m = _make_market(now, outcomePrices='["0.60", "0.40"]')
+        result = process_market(m, now)
+        assert result is not None
+        assert "NO" in result["trade_label"]
+        assert result["trade_side_class"] == "no"
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_ev_formula_positive(self, mock_analyzers, now):
+        """Item 11: EV = (win_prob / buy_price - 1) × 100 for positive edge."""
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.80,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "high",
+            "data_point": "test",
+        }
+        m = _make_market(now, outcomePrices='["0.60", "0.40"]')
+        result = process_market(m, now)
+        assert result is not None
+        # Positive edge: buy Yes@0.60, win_prob=0.80
+        # EV = (0.80/0.60 - 1) × 100 = 33.33
+        expected_ev = (0.80 / 0.60 - 1) * 100
+        assert abs(result["ev_per_100"] - expected_ev) < 0.1
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_ev_formula_negative(self, mock_analyzers, now):
+        """Item 11: EV = ((1-est_prob) / buy_price_no - 1) × 100 for negative edge."""
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.30,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "high",
+            "data_point": "test",
+        }
+        # Binary: Yes=0.60, No=0.40. Edge=-0.30 → buy No@0.40
+        m = _make_market(now, outcomePrices='["0.60", "0.40"]')
+        result = process_market(m, now)
+        assert result is not None
+        # Negative edge: buy No@0.40, win_prob = 1-0.30 = 0.70
+        # EV = (0.70/0.40 - 1) × 100 = 75.0
+        expected_ev = (0.70 / 0.40 - 1) * 100
+        assert abs(result["ev_per_100"] - expected_ev) < 0.1
+
+    @patch("polymarket_scanner.run_analyzers")
+    def test_edge_confidence_affects_score(self, mock_analyzers, now):
+        """Item 16: low confidence edge should score lower."""
+        # High confidence
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.80,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "high",
+            "data_point": "test",
+        }
+        m = _make_market(now, outcomePrices='["0.60", "0.40"]')
+        r_high = process_market(m, now)
+
+        # Low confidence
+        mock_analyzers.return_value = {
+            "estimated_prob": 0.80,
+            "source": "OpenWeatherMap",
+            "analysis": "Test",
+            "confidence": "low",
+            "data_point": "test",
+        }
+        r_low = process_market(m, now)
+
+        assert r_high is not None and r_low is not None
+        assert r_high["score"] > r_low["score"]
+
+
+# =========================================================================
 # Weather Analyzer — city detection, unit conversion, question parsing
 # =========================================================================
 
@@ -744,6 +976,19 @@ class TestFindCity:
         assert result is not None
         assert result[0] == "miami"
 
+    def test_la_alias_removed(self):
+        """Item 9: 'la' alias removed to prevent false positives."""
+        assert "la" not in CITY_COORDS
+        result = _find_city("la température est élevée")
+        # Should NOT match "la" as Los Angeles
+        assert result is None
+
+    def test_los_angeles_still_works(self):
+        """'los angeles' (full name) still matches."""
+        result = _find_city("Weather in Los Angeles this week")
+        assert result is not None
+        assert result[0] == "los angeles"
+
 
 class TestToFahrenheit:
     def test_fahrenheit_passthrough(self):
@@ -760,29 +1005,49 @@ class TestToFahrenheit:
         assert abs(_to_fahrenheit(20, "°C") - 68) < 0.01
 
 
+# =========================================================================
+# _horizon_confidence() — forecast horizon degradation (item 12)
+# =========================================================================
+
+class TestHorizonConfidence:
+    """Test confidence degradation based on forecast horizon."""
+
+    def test_short_horizon_high_confidence(self):
+        """Entries within 24h → high confidence."""
+        now_dt = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        entries = _make_owm_entries([70] * 4, base_dt=now_dt)  # 0-9h
+        assert _horizon_confidence(entries, now_dt) == "high"
+
+    def test_medium_horizon(self):
+        """Entries up to 48h → medium confidence."""
+        now_dt = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        entries = _make_owm_entries([70] * 16, base_dt=now_dt)  # 0-45h
+        assert _horizon_confidence(entries, now_dt) == "medium"
+
+    def test_long_horizon_low_confidence(self):
+        """Entries up to 5 days → low confidence."""
+        now_dt = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        entries = _make_owm_entries([70] * 40, base_dt=now_dt)  # 0-117h
+        assert _horizon_confidence(entries, now_dt) == "low"
+
+    def test_empty_entries_low(self):
+        """No entries → low confidence."""
+        assert _horizon_confidence([]) == "low"
+
+
+# =========================================================================
+# Weather Analyzer — sigmoid temp, composite rain (items 3, 4, 5)
+# =========================================================================
+
 class TestAnalyzeWeather:
     """Test weather analysis with mocked OWM API responses."""
 
-    def _make_owm_entries(self, temps, pops=None, base_dt=None):
-        """Create mock OWM forecast entries."""
-        if base_dt is None:
-            base_dt = datetime.now(timezone.utc)
-        entries = []
-        for i, temp in enumerate(temps):
-            entry = {
-                "dt": int((base_dt + timedelta(hours=3 * i)).timestamp()),
-                "main": {"temp": temp, "temp_max": temp + 2, "temp_min": temp - 2},
-                "pop": pops[i] if pops else 0.0,
-            }
-            entries.append(entry)
-        return entries
-
     @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
     @patch("polymarket_scanner._fetch_owm_forecast")
-    def test_temp_above_detected(self, mock_fetch):
-        """Temperature market: forecast 85°F, threshold 80°F → high prob."""
+    def test_temp_above_detected_sigmoid(self, mock_fetch):
+        """Item 3: sigmoid calibration — forecast well above threshold → high prob."""
         end_dt = datetime.now(timezone.utc) + timedelta(days=2)
-        entries = self._make_owm_entries([82, 85, 78, 84, 80, 86, 79, 83])
+        entries = _make_owm_entries([82, 85, 78, 84, 80, 86, 79, 83])
         mock_fetch.return_value = entries
 
         result = analyze_weather(
@@ -791,16 +1056,16 @@ class TestAnalyzeWeather:
         )
         assert result is not None
         assert result["source"] == "OpenWeatherMap"
-        assert result["estimated_prob"] > 0.5
-        assert result["confidence"] == "high"
+        # Sigmoid: max_high=88, margin=8, prob=1/(1+exp(-8/3)) ≈ 0.93
+        assert result["estimated_prob"] > 0.8
         assert "80" in result["analysis"]
 
     @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
     @patch("polymarket_scanner._fetch_owm_forecast")
-    def test_temp_below_threshold(self, mock_fetch):
-        """Forecast well below threshold → low prob."""
+    def test_temp_below_threshold_sigmoid(self, mock_fetch):
+        """Item 3: sigmoid — forecast well below threshold → low prob."""
         end_dt = datetime.now(timezone.utc) + timedelta(days=2)
-        entries = self._make_owm_entries([60, 62, 58, 61, 59, 63, 57, 60])
+        entries = _make_owm_entries([60, 62, 58, 61, 59, 63, 57, 60])
         mock_fetch.return_value = entries
 
         result = analyze_weather(
@@ -808,14 +1073,32 @@ class TestAnalyzeWeather:
             end_dt,
         )
         assert result is not None
-        assert result["estimated_prob"] < 0.2
+        # Sigmoid: max_high=65, margin=-15, prob=1/(1+exp(5)) ≈ 0.007
+        assert result["estimated_prob"] < 0.05
 
     @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
     @patch("polymarket_scanner._fetch_owm_forecast")
-    def test_rain_detected(self, mock_fetch):
-        """Rain question with high PoP → high prob."""
+    def test_temp_near_threshold_sigmoid(self, mock_fetch):
+        """Sigmoid: forecast near threshold → ~50% probability."""
         end_dt = datetime.now(timezone.utc) + timedelta(days=2)
-        entries = self._make_owm_entries(
+        # temp_max = temp+2, so max_high = 82. Threshold 80.
+        # margin = 2, prob = 1/(1+exp(-2/3)) ≈ 0.66
+        entries = _make_owm_entries([78, 79, 80, 79, 78, 77, 76, 78])
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will temperature in Denver exceed 80F?",
+            end_dt,
+        )
+        assert result is not None
+        assert 0.4 < result["estimated_prob"] < 0.8
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_rain_composite_formula(self, mock_fetch):
+        """Item 5: composite rain prob = 1 - prod(1 - pop_i)."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries(
             [70] * 8,
             pops=[0.1, 0.3, 0.8, 0.9, 0.7, 0.4, 0.2, 0.1],
         )
@@ -826,23 +1109,26 @@ class TestAnalyzeWeather:
             end_dt,
         )
         assert result is not None
-        assert result["estimated_prob"] >= 0.8
+        # Composite: 1 - (0.9*0.7*0.2*0.1*0.3*0.6*0.8*0.9) ≈ 0.998
+        assert result["estimated_prob"] >= 0.99
         assert "rain" in result["analysis"].lower()
+        assert "composite" in result["analysis"].lower()
 
     @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
     @patch("polymarket_scanner._fetch_owm_forecast")
-    def test_rain_low_pop(self, mock_fetch):
-        """Dry forecast → low prob."""
+    def test_rain_low_pop_composite(self, mock_fetch):
+        """Low PoPs still accumulate with composite formula but stay reasonable."""
         end_dt = datetime.now(timezone.utc) + timedelta(days=2)
-        entries = self._make_owm_entries(
+        entries = _make_owm_entries(
             [70] * 8,
-            pops=[0.05, 0.0, 0.1, 0.0, 0.05, 0.0, 0.0, 0.02],
+            pops=[0.02, 0.0, 0.05, 0.0, 0.02, 0.0, 0.0, 0.01],
         )
         mock_fetch.return_value = entries
 
         result = analyze_weather("Will it rain in Denver?", end_dt)
         assert result is not None
-        assert result["estimated_prob"] < 0.2
+        # Composite: 1 - (0.98*1.0*0.95*1.0*0.98*1.0*1.0*0.99) ≈ 0.097
+        assert result["estimated_prob"] < 0.15
 
     def test_no_api_key_returns_none(self):
         """Without API key, analyze_weather returns None."""
@@ -870,61 +1156,100 @@ class TestAnalyzeWeather:
         )
         assert result is None
 
+    # --- Flexible regex (item 4) ---
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_flexible_question_format(self, mock_fetch):
+        """Item 4: keyword detection works regardless of city/threshold order."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries([82, 85, 78, 84, 80, 86, 79, 83])
+        mock_fetch.return_value = entries
+
+        # Threshold before city (non-standard order)
+        result = analyze_weather(
+            "Will 80F temperature be exceeded in New York?",
+            end_dt,
+        )
+        assert result is not None
+        assert result["estimated_prob"] > 0.5
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_heat_keyword_detected(self, mock_fetch):
+        """Item 4: 'heat' keyword triggers temperature analysis."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries([90, 92, 88, 91])
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will the heat wave in Miami exceed 95F?",
+            end_dt,
+        )
+        assert result is not None
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_precipitation_keyword_detected(self, mock_fetch):
+        """Item 4: 'precipitation' keyword triggers rain analysis."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries([70] * 4, pops=[0.8, 0.7, 0.6, 0.5])
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will there be precipitation in Chicago?",
+            end_dt,
+        )
+        assert result is not None
+        assert result["estimated_prob"] > 0.5
+
+    # --- Confidence in results (item 12) ---
+
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner._fetch_owm_forecast")
+    def test_confidence_returned_in_result(self, mock_fetch):
+        """Weather result includes confidence level."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=2)
+        entries = _make_owm_entries([82, 85, 78, 84, 80, 86, 79, 83])
+        mock_fetch.return_value = entries
+
+        result = analyze_weather(
+            "Will temperature in New York exceed 80F?",
+            end_dt,
+        )
+        assert result is not None
+        assert result["confidence"] in ("high", "medium", "low")
+
 
 # =========================================================================
-# classify() with edge_analysis
+# OWM cache purge (item 8)
 # =========================================================================
 
-class TestClassifyEdge:
-    """Test that edge_analysis triggers the 'edge' tier."""
+class TestOWMCachePurge:
+    """Test that expired OWM cache entries are purged."""
 
-    def test_edge_above_min_edge(self):
-        """Edge >= MIN_EDGE → edge tier."""
-        ea = {"edge": 0.15, "source": "OpenWeatherMap"}
-        tier, label, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
-        assert tier == "edge"
-        assert rtype == "edge"
-        assert "OpenWeatherMap" in label
+    @patch("polymarket_scanner.OWM_API_KEY", "fake-key")
+    @patch("polymarket_scanner.requests.get")
+    def test_expired_entries_purged(self, mock_get):
+        """Item 8: expired cache entries are removed on next fetch."""
+        import polymarket_scanner as ps
 
-    def test_edge_below_min_edge(self):
-        """Edge < MIN_EDGE → falls through to normal classify."""
-        ea = {"edge": 0.05, "source": "OpenWeatherMap"}
-        tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=ea)
-        assert tier is None  # 70% = not near_certain, not arb
+        # Prepare mock response
+        mock_resp = mock_get.return_value
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"list": [{"dt": 1000, "main": {"temp": 70}}]}
 
-    def test_edge_negative_large(self):
-        """Negative edge (market overprices) → still triggers if abs >= MIN_EDGE."""
-        ea = {"edge": -0.20, "source": "OpenWeatherMap"}
-        tier, _, rtype = classify(0.70, 0.0, 1.0, edge_analysis=ea)
-        assert tier == "edge"
-        assert rtype == "edge"
+        # Manually insert an expired entry
+        with ps._owm_lock:
+            ps._owm_cache["99.99,99.99"] = (0, [])  # ts=0 → ancient, expired
 
-    def test_edge_none_no_effect(self):
-        """No edge_analysis → normal behavior."""
-        tier, _, _ = classify(0.70, 0.0, 1.0, edge_analysis=None)
-        assert tier is None
+        # Trigger a new fetch which should purge expired
+        ps._fetch_owm_forecast(40.71, -74.01)
 
-    def test_edge_still_filters_too_certain(self):
-        """0.996 is filtered even with edge analysis."""
-        ea = {"edge": 0.20, "source": "Test"}
-        tier, _, _ = classify(0.996, 0.0, 1.0, edge_analysis=ea)
-        assert tier is None
+        with ps._owm_lock:
+            assert "99.99,99.99" not in ps._owm_cache
 
-
-# =========================================================================
-# compute_score() with ext_edge
-# =========================================================================
-
-class TestComputeScoreEdge:
-
-    def test_edge_scores_higher_than_near_certain(self):
-        s_edge = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20)
-        s_nc = compute_score(0.0, 1.0, 0.94, 5, 50000, ext_edge=0.0)
-        assert s_edge > s_nc * 5
-
-    def test_edge_scores_comparable_to_arbs(self):
-        s_edge = compute_score(0.0, 1.0, 0.70, 5, 50000, ext_edge=0.20)
-        s_arb = compute_score(0.05, 0.95, 0.50, 5, 50000, ext_edge=0.0)
-        # Both should be in similar range (edge is real edge too)
-        assert s_edge > 0
-        assert s_arb > 0
+        # Cleanup
+        with ps._owm_lock:
+            ps._owm_cache.clear()

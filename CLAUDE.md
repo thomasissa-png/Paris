@@ -34,9 +34,10 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 
 ### Scoring Formula
 `score = edge × (1/days_left) × log(liquidity)`
-- **External edge** = `ext_edge × 40` (highest weight — real informational advantage)
+- **External edge** = `ext_edge × conf_mult × 40` (highest weight — modulated by forecast confidence)
 - **Arb edge** = `deviation × 50` (dominant weight — real mechanical edge)
 - **Near-certain edge** = `(max_price - 0.70) × 0.1` (minimal weight — no real edge)
+- **Confidence multiplier**: `high=1.0, medium=0.7, low=0.4` — degrades score for distant forecasts
 
 ### Key Thresholds
 - `MIN_LIQUIDITY = 5000` — markets below $5K liquidity are unexecutable
@@ -44,7 +45,7 @@ The scanner prioritizes **real mathematical edge** over raw probability:
 - `MAX_ANN_ROI = 1000.0` — cap annualized ROI to avoid absurd display
 - `EST_FEE_PCT = 2.0` — estimated round-trip trading fees
 - `MIN_EDGE = 0.10` — minimum 10% divergence for edge tier
-- `max_price > 0.995` → filtered (negligible profit)
+- `max_price > 0.995` → filtered (negligible profit) — **except** for edge tier (edge checked first)
 - Volume 24h = 0 (when data available) → filtered as dead market
 - Arb deviation < 2% → filtered (unprofitable after fees)
 
@@ -61,10 +62,17 @@ The scanner can call external APIs to detect informational edge. Analyzers are *
 ### Weather Analyzer
 - **API**: OpenWeatherMap 5-day/3h forecast (free tier: 1000 calls/day)
 - **Env var**: `OPENWEATHERMAP_API_KEY`
+- **Startup validation**: API key tested at startup, warns if invalid/missing
 - **Detects**: temperature threshold markets, rain/snow probability markets
-- **Cities**: 30+ pre-mapped US + major world cities (lat/lon lookup)
-- **Cache**: 10 min TTL per city to avoid API spam
-- **Edge calc**: `estimated_prob - market_price` → if |edge| > 10%, classified as "edge" tier
+- **Question parsing**: keyword-based detection (flexible order), not rigid regex
+- **Cities**: 30+ pre-mapped US + major world cities (lat/lon lookup). "la" alias removed (false positives)
+- **Cache**: 10 min TTL per city, expired entries purged automatically, thread-safe
+- **Temperature**: sigmoid calibration `P = 1/(1+exp(-margin/3))` where margin = max_forecast - threshold
+- **Rain**: composite formula `P(at least one) = 1 - ∏(1 - pop_i)` — not max(PoP)
+- **Confidence**: degrades by forecast horizon (J+1 = high, J+2-3 = medium, J+4-5 = low)
+- **Edge calc**: `estimated_prob - yes_price` (binary: float_prices[0]) → if |edge| > 10%, classified as "edge" tier
+- **EV formula**: `(win_prob / buy_price - 1) × 100` where win_prob = est_prob (buy Yes) or 1-est_prob (buy No)
+- **Analyzers run in process_market()**: call order is documented, weather first, future analyzers appended
 
 ### Future Analyzers (architecture ready)
 - **Sports**: The Odds API — compare bookmaker consensus to Polymarket prices
@@ -78,7 +86,9 @@ The scanner can call external APIs to detect informational edge. Analyzers are *
 - **Overround excluded**: sum > 1.0 is the market's margin — excluded entirely (not shown)
 - **Fees estimated at ~2%**: arb profit shown net of estimated fees
 - **External analyzers optional**: zero-config without API keys, enhanced with keys via env vars
-- **Weather cache**: 10 min TTL per city, thread-safe, prevents API key exhaustion
+- **Weather cache**: 10 min TTL per city, thread-safe, auto-purge expired entries, prevents API key exhaustion
+- **Analyzer call order**: analyzers run inside `process_market()` via `run_analyzers()` — weather first, future analyzers appended. Order is deterministic and documented
+- **OWM calls synchronous**: acceptable because cache deduplicates requests (10 min TTL). Async would add complexity for minimal gain at current scale
 
 ## Testing
 **ALWAYS run tests before committing**:
@@ -86,13 +96,15 @@ The scanner can call external APIs to detect informational edge. Analyzers are *
 python -m pytest tests/ -v
 ```
 
-Test file: `tests/test_scanner.py` (138 tests) — covers:
-- classify(): arb tiers (super/interesting), edge tier, near-certain watch-only, overround excluded, boundaries
-- compute_score(): edge > arb >> near-certain, time/liquidity weighting
-- Weather analyzer: city detection, temp parsing, rain PoP, unit conversion, mocked OWM API
+Test file: `tests/test_scanner.py` (160 tests) — covers:
+- classify(): arb tiers (super/interesting), edge tier (before 0.995), near-certain watch-only, overround excluded, boundaries
+- compute_score(): edge > arb >> near-certain, time/liquidity weighting, confidence multiplier
+- Weather analyzer: city detection, sigmoid temp, composite rain, flexible keywords, horizon confidence, mocked OWM API
+- Edge pipeline: Yes price comparison, positive/negative edge trade recs, EV formula, confidence scoring
 - Crypto regex: 10 true positives + 10 false-positive guards
 - Category extraction: 8 categories + tag priority + fallback
 - process_market() pipeline: arb detection + EV + fees + net, near-certain risk, ROI cap, volume 24h filter, thin detection, multi-outcome arb labels, all filters, edge cases
+- Cleanup: "la" alias removed, OWM cache purge
 
 ## File Structure
 ```

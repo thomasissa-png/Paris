@@ -73,7 +73,7 @@ CRYPTO_RE = re.compile(
 # Map city names / aliases → (lat, lon) for common Polymarket weather markets
 CITY_COORDS: dict[str, tuple[float, float]] = {
     "new york": (40.71, -74.01), "nyc": (40.71, -74.01), "manhattan": (40.71, -74.01),
-    "los angeles": (34.05, -118.24), "la": (34.05, -118.24),
+    "los angeles": (34.05, -118.24),
     "chicago": (41.88, -87.63), "houston": (29.76, -95.37),
     "phoenix": (33.45, -112.07), "philadelphia": (39.95, -75.17),
     "san antonio": (29.42, -98.49), "san diego": (32.72, -117.16),
@@ -89,29 +89,19 @@ CITY_COORDS: dict[str, tuple[float, float]] = {
     "toronto": (43.65, -79.38), "sydney": (-33.87, 151.21),
 }
 
-# Regex to parse weather market questions
-_WEATHER_TEMP_RE = re.compile(
-    r"(?:temperature|high|low|temp).*?"
-    r"(?:in|at|for)\s+"
-    r"(?P<city>[A-Z][\w\s]{2,25}?)"
-    r".*?(?:above|over|exceed|reach|below|under|at least|hit)\s*"
-    r"(?P<threshold>\d+(?:\.\d+)?)\s*"
-    r"(?P<unit>[°]?\s*[FCfc]|fahrenheit|celsius)?",
+# --- Keyword-based weather question detection (flexible order) ---
+# Step 1: detect question type via keywords
+_TEMP_KEYWORDS_RE = re.compile(
+    r"\b(?:temperature|high|low|temp|hot|cold|warm|heat|freeze|frost)\b",
     re.IGNORECASE,
 )
-
-_WEATHER_RAIN_RE = re.compile(
-    r"(?:rain|precipitation|snow|storm)"
-    r".*?(?:in|at|for)\s+"
-    r"(?P<city>[A-Z][\w\s]{2,25}?)"
-    r"(?:.*?(?:on|by|before)\s+(?P<date>\w+\s+\d+|\w+day))?",
+_RAIN_KEYWORDS_RE = re.compile(
+    r"\b(?:rain|precipitation|snow|storm|shower|drizzle)\b",
     re.IGNORECASE,
 )
-
-_WEATHER_GENERAL_RE = re.compile(
-    r"(?:weather|temperature|rain|snow|precipitation|high|heat|cold|freeze|frost)"
-    r".*?(?:in|at|for)\s+"
-    r"(?P<city>[A-Z][\w\s]{2,25})",
+# Step 2: extract threshold + unit (city found separately via _find_city)
+_TEMP_THRESHOLD_RE = re.compile(
+    r"(?P<threshold>\d+(?:\.\d+)?)\s*(?P<unit>[°]?\s*[FCfc]|fahrenheit|celsius)?",
     re.IGNORECASE,
 )
 
@@ -124,10 +114,15 @@ def _fetch_owm_forecast(lat: float, lon: float) -> list[dict] | None:
     if not OWM_API_KEY:
         return None
     cache_key = f"{lat:.2f},{lon:.2f}"
+    now_ts = _time.time()
     with _owm_lock:
+        # Purge expired entries to prevent unbounded cache growth
+        expired = [k for k, (ts, _) in _owm_cache.items() if now_ts - ts >= OWM_CACHE_TTL]
+        for k in expired:
+            del _owm_cache[k]
         if cache_key in _owm_cache:
             ts, data = _owm_cache[cache_key]
-            if _time.time() - ts < OWM_CACHE_TTL:
+            if now_ts - ts < OWM_CACHE_TTL:
                 return data
 
     try:
@@ -163,11 +158,37 @@ def _to_fahrenheit(val: float, unit: str | None) -> float:
     return val  # default: already Fahrenheit
 
 
+def _horizon_confidence(entries: list[dict], now_dt: datetime | None = None) -> str:
+    """Determine confidence level based on forecast horizon (item 12).
+
+    J+0-1 (0-24h)  → high
+    J+2-3 (24-72h) → medium
+    J+4-5 (72h+)   → low
+    Uses the latest entry's timestamp to determine horizon.
+    """
+    if not entries:
+        return "low"
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    latest_dt = max(
+        datetime.fromtimestamp(e.get("dt", 0), tz=timezone.utc)
+        for e in entries
+    )
+    hours_out = (latest_dt - now_dt).total_seconds() / 3600
+    if hours_out <= 24:
+        return "high"
+    elif hours_out <= 72:
+        return "medium"
+    return "low"
+
+
 def analyze_weather(question: str, end_dt: datetime) -> dict | None:
     """Analyze a weather market question against OWM forecast data.
 
-    Returns dict with analysis results or None if not a weather market
-    or analysis not possible.
+    Uses keyword detection (not rigid regex) for flexible question parsing.
+    Temperature: sigmoid calibration for probability estimation.
+    Rain: composite formula P(at least one) = 1 - prod(1 - pop_i).
+    Confidence: degrades by forecast horizon (J+1 vs J+5).
 
     Return keys:
         estimated_prob (float 0-1): our probability estimate
@@ -179,105 +200,98 @@ def analyze_weather(question: str, end_dt: datetime) -> dict | None:
     if not OWM_API_KEY:
         return None
 
-    # --- Try temperature pattern ---
-    m_temp = _WEATHER_TEMP_RE.search(question)
-    if m_temp:
-        city_text = m_temp.group("city").strip()
-        threshold = float(m_temp.group("threshold"))
-        unit = m_temp.group("unit")
+    q_lower = question.lower()
+    is_temp = bool(_TEMP_KEYWORDS_RE.search(question))
+    is_rain = bool(_RAIN_KEYWORDS_RE.search(question))
+
+    if not is_temp and not is_rain:
+        return None
+
+    # --- Find city (flexible — works regardless of question order) ---
+    city_info = _find_city(question)
+    if not city_info:
+        return None
+    city_name, lat, lon = city_info
+
+    entries = _fetch_owm_forecast(lat, lon)
+    if not entries:
+        return None
+
+    # Filter entries up to market end date
+    now_dt = datetime.now(timezone.utc)
+    relevant = []
+    for e in entries:
+        dt_unix = e.get("dt", 0)
+        entry_dt = datetime.fromtimestamp(dt_unix, tz=timezone.utc)
+        if entry_dt <= end_dt:
+            relevant.append(e)
+    if not relevant:
+        return None
+
+    # Confidence degrades by forecast horizon (item 12)
+    confidence = _horizon_confidence(relevant, now_dt)
+
+    # --- Temperature analysis (sigmoid calibration, item 3) ---
+    if is_temp:
+        # Extract threshold from question
+        m_thresh = _TEMP_THRESHOLD_RE.search(question)
+        if not m_thresh:
+            return None
+        threshold = float(m_thresh.group("threshold"))
+        unit = m_thresh.group("unit")
         threshold_f = _to_fahrenheit(threshold, unit)
 
-        city_info = _find_city(city_text) or _find_city(question)
-        if not city_info:
-            return None
-        city_name, lat, lon = city_info
+        is_above = any(w in q_lower for w in
+                       ["above", "over", "exceed", "reach", "hit", "at least"])
 
-        entries = _fetch_owm_forecast(lat, lon)
-        if not entries:
-            return None
-
-        # Filter entries up to market end date
-        relevant = []
-        for e in entries:
-            dt_unix = e.get("dt", 0)
-            entry_dt = datetime.fromtimestamp(dt_unix, tz=timezone.utc)
-            if entry_dt <= end_dt:
-                relevant.append(e)
-        if not relevant:
-            return None
-
-        # Check high temperatures
-        is_above = any(w in question.lower() for w in ["above", "over", "exceed", "reach", "hit", "at least"])
         highs = [e.get("main", {}).get("temp_max", 0) for e in relevant]
         max_high = max(highs) if highs else 0
 
+        # Sigmoid calibration: prob = 1/(1 + exp(-margin/k))
+        # margin = max_forecast - threshold (for "above" questions)
+        # k=3 gives smooth transition around threshold
         if is_above:
-            above_count = sum(1 for h in highs if h >= threshold_f)
-            prob = above_count / len(highs) if highs else 0
-            # Boost if max is well above threshold
-            if max_high >= threshold_f + 5:
-                prob = min(prob + 0.15, 1.0)
+            margin = max_high - threshold_f
+            prob = 1.0 / (1.0 + math.exp(-margin / 3.0))
             direction = "above"
         else:
-            below_count = sum(1 for h in highs if h < threshold_f)
-            prob = below_count / len(highs) if highs else 0
-            if max_high < threshold_f - 5:
-                prob = min(prob + 0.15, 1.0)
+            margin = threshold_f - max_high
+            prob = 1.0 / (1.0 + math.exp(-margin / 3.0))
             direction = "below"
-
-        confidence = "high" if len(relevant) >= 8 else "medium" if len(relevant) >= 3 else "low"
 
         return {
             "estimated_prob": round(prob, 3),
             "source": "OpenWeatherMap",
             "analysis": f"Forecast: max {max_high:.0f}°F for {city_name.title()} "
-                        f"({len(relevant)} data points). Threshold: {direction} {threshold_f:.0f}°F.",
+                        f"({len(relevant)} pts, {confidence} conf). "
+                        f"Threshold: {direction} {threshold_f:.0f}°F.",
             "confidence": confidence,
             "data_point": f"{max_high:.0f}°F max forecast",
         }
 
-    # --- Try rain/precipitation pattern ---
-    m_rain = _WEATHER_RAIN_RE.search(question)
-    if m_rain:
-        city_text = m_rain.group("city").strip()
-        city_info = _find_city(city_text) or _find_city(question)
-        if not city_info:
-            return None
-        city_name, lat, lon = city_info
-
-        entries = _fetch_owm_forecast(lat, lon)
-        if not entries:
-            return None
-
-        relevant = []
-        for e in entries:
-            dt_unix = e.get("dt", 0)
-            entry_dt = datetime.fromtimestamp(dt_unix, tz=timezone.utc)
-            if entry_dt <= end_dt:
-                relevant.append(e)
-        if not relevant:
-            return None
-
-        # Check precipitation probability
+    # --- Rain/precipitation analysis (composite formula, item 5) ---
+    if is_rain:
         pop_values = [e.get("pop", 0) for e in relevant]
         max_pop = max(pop_values) if pop_values else 0
         avg_pop = sum(pop_values) / len(pop_values) if pop_values else 0
 
-        # "Will it rain?" → prob = max chance of precipitation in the window
-        is_snow = "snow" in question.lower()
-        precip_type = "snow" if is_snow else "rain"
+        # Composite: P(at least one period with rain) = 1 - prod(1 - pop_i)
+        no_precip = 1.0
+        for pop in pop_values:
+            no_precip *= (1.0 - pop)
+        prob = 1.0 - no_precip
 
-        # Use max PoP as probability (any rain in window)
-        prob = max_pop
-        confidence = "high" if len(relevant) >= 8 else "medium" if len(relevant) >= 3 else "low"
+        is_snow = "snow" in q_lower
+        precip_type = "snow" if is_snow else "rain"
 
         return {
             "estimated_prob": round(prob, 3),
             "source": "OpenWeatherMap",
-            "analysis": f"Forecast: {precip_type} prob max {max_pop*100:.0f}% / avg {avg_pop*100:.0f}% "
-                        f"for {city_name.title()} ({len(relevant)} data points).",
+            "analysis": f"Forecast: {precip_type} composite prob {prob*100:.0f}% "
+                        f"(max PoP {max_pop*100:.0f}%, avg {avg_pop*100:.0f}%) "
+                        f"for {city_name.title()} ({len(relevant)} pts, {confidence} conf).",
             "confidence": confidence,
-            "data_point": f"{max_pop*100:.0f}% max PoP",
+            "data_point": f"{prob*100:.0f}% composite PoP",
         }
 
     return None
@@ -423,13 +437,14 @@ def classify(max_price: float, deviation: float,
     - overround (sum > 1.0) = excluded (margin against you)
     - arbs <2% excluded (unprofitable after ~2% fees)
     """
-    if max_price > 0.995:
-        return (None, "", "")  # Too certain — negligible profit
-
     # --- External edge (data-driven) — REAL informational advantage ---
+    # Checked FIRST: even very certain markets can have edge (item 6)
     if edge_analysis and abs(edge_analysis.get("edge", 0)) >= MIN_EDGE:
         source = edge_analysis.get("source", "Analyse")
         return ("edge", f"Edge {source}", "edge")
+
+    if max_price > 0.995:
+        return (None, "", "")  # Too certain — negligible profit
 
     # --- Guaranteed arbitrage (sum < 1.0, min 2% to cover fees) ---
     if price_sum < 1.0 and deviation > 0.04:
@@ -444,12 +459,20 @@ def classify(max_price: float, deviation: float,
     return (None, "", "")
 
 
+_CONFIDENCE_MULT = {"high": 1.0, "medium": 0.7, "low": 0.4}
+
+
 def compute_score(deviation: float, price_sum: float, max_price: float,
                   days_left: float, liquidity: float,
-                  ext_edge: float = 0.0) -> float:
-    """Score by attractiveness. Edge > arbs >> near-certain."""
+                  ext_edge: float = 0.0,
+                  confidence: str = "high") -> float:
+    """Score by attractiveness. Edge > arbs >> near-certain.
+
+    confidence (str): "high"/"medium"/"low" — modulates ext_edge weight (item 16).
+    """
     if ext_edge >= MIN_EDGE:
-        edge = ext_edge * 40           # external edge: very high weight
+        conf_mult = _CONFIDENCE_MULT.get(confidence, 0.4)
+        edge = ext_edge * conf_mult * 40  # external edge weighted by confidence
     elif price_sum < 1.0 and deviation > 0.02:
         edge = deviation * 50          # arb: dominant weight
     else:
@@ -545,11 +568,12 @@ def process_market(m: dict, now: datetime) -> dict | None:
     analysis_result = run_analyzers(question, end_dt)
     if analysis_result:
         est_prob = analysis_result["estimated_prob"]
-        # Edge = how much our estimate disagrees with market (for "Yes" outcome)
-        # Positive edge = market underprices the likely outcome
-        raw_edge = est_prob - max_price
+        # Edge = est_prob vs Yes price (items 1-2: use Yes price, not max_price)
+        # For binary: Yes = float_prices[0], for multi: Yes = top outcome
+        yes_market_price = float_prices[0] if is_binary else max_price
+        raw_edge = est_prob - yes_market_price
         analysis_result["edge"] = round(raw_edge, 4)
-        analysis_result["market_price"] = max_price
+        analysis_result["market_price"] = yes_market_price
         edge_analysis = analysis_result
 
     # --- Classify ---
@@ -576,24 +600,33 @@ def process_market(m: dict, now: datetime) -> dict | None:
         is_guaranteed = True
     elif reason_type == "edge":
         edge_val = edge_analysis["edge"] if edge_analysis else 0
+        # Items 1-2: edge is est_prob - yes_price
+        # Positive edge → Yes is underpriced → BUY YES
+        # Negative edge → Yes is overpriced → BUY NO
         if edge_val >= 0:
-            trade_label = f"BUY {truncate(max_outcome_name.upper(), 12)} @ {int(max_price * 100)}\u00a2"
-            trade_side_class = "yes" if (max_idx == 0 or not is_binary) else "no"
-            buy_price = max_price
-        else:
-            # Negative edge = market overprices Yes, so buy No / cheapest
+            # Buy Yes (outcome 0 for binary, top outcome for multi)
             if is_binary:
-                other_idx = 1 - max_idx
-                other_name = outcomes[other_idx] if other_idx < len(outcomes) else "No"
-                other_price = float_prices[other_idx]
+                buy_name = outcomes[0] if outcomes else "Yes"
+                buy_price = float_prices[0]
+                trade_side_class = "yes"
+            else:
+                buy_name = max_outcome_name
+                buy_price = max_price
+                trade_side_class = "yes"
+            trade_label = f"BUY {truncate(buy_name.upper(), 12)} @ {int(buy_price * 100)}\u00a2"
+        else:
+            # Buy No (outcome 1 for binary, cheapest for multi)
+            if is_binary:
+                buy_name = outcomes[1] if len(outcomes) > 1 else "No"
+                buy_price = float_prices[1]
+                trade_side_class = "no"
             else:
                 other_idx = min((i for i in range(num_outcomes) if i != max_idx),
                                 key=lambda i: float_prices[i])
-                other_name = outcomes[other_idx] if other_idx < len(outcomes) else f"Out.{other_idx+1}"
-                other_price = float_prices[other_idx]
-            trade_label = f"BUY {truncate(other_name.upper(), 12)} @ {int(other_price * 100)}\u00a2"
-            trade_side_class = "no" if is_binary else "yes"
-            buy_price = other_price
+                buy_name = outcomes[other_idx] if other_idx < len(outcomes) else f"Out.{other_idx+1}"
+                buy_price = float_prices[other_idx]
+                trade_side_class = "no"
+            trade_label = f"BUY {truncate(buy_name.upper(), 12)} @ {int(buy_price * 100)}\u00a2"
         is_guaranteed = False
     else:
         trade_label = f"BUY {truncate(max_outcome_name.upper(), 12)} @ {int(max_price * 100)}\u00a2"
@@ -613,8 +646,14 @@ def process_market(m: dict, now: datetime) -> dict | None:
         net_per_100 = round(ev_per_100 - fee_per_100, 2)
         arb_warning = f"{num_outcomes} trades requis"
     elif reason_type == "edge" and edge_analysis:
-        edge_abs = abs(edge_analysis["edge"])
-        ev_per_100 = round(edge_abs * 100, 2)  # expected gain per $100
+        # Item 11: correct EV = (win_prob / buy_price - 1) × 100
+        # win_prob depends on which side we buy:
+        #   positive edge → buy Yes → win_prob = est_prob
+        #   negative edge → buy No  → win_prob = 1 - est_prob
+        est_prob = edge_analysis.get("estimated_prob", 0)
+        edge_val = edge_analysis.get("edge", 0)
+        win_prob = est_prob if edge_val >= 0 else (1.0 - est_prob)
+        ev_per_100 = round((win_prob / buy_price - 1) * 100, 2) if buy_price > 0 else 0.0
         risk_per_100 = 100.0  # you can still lose
         fee_per_100 = round(EST_FEE_PCT, 2)
         net_per_100 = round(ev_per_100 - fee_per_100, 2)
@@ -632,7 +671,9 @@ def process_market(m: dict, now: datetime) -> dict | None:
 
     # --- Composite score ---
     ext_edge = abs(edge_analysis["edge"]) if edge_analysis else 0.0
-    score = compute_score(deviation, price_sum, max_price, days_left, liquidity, ext_edge)
+    edge_conf = edge_analysis.get("confidence", "high") if edge_analysis else "high"
+    score = compute_score(deviation, price_sum, max_price, days_left, liquidity,
+                          ext_edge, confidence=edge_conf)
 
     return {
         "tier": tier,
@@ -1322,9 +1363,33 @@ def api_scan():
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _validate_api_keys():
+    """Log status of optional API keys at startup (item 15)."""
+    if OWM_API_KEY:
+        print(f"  [OK] OpenWeatherMap API key configured ({OWM_API_KEY[:4]}...)")
+        # Quick validation: test a known city
+        try:
+            resp = requests.get(OWM_FORECAST_URL, params={
+                "lat": 40.71, "lon": -74.01, "appid": OWM_API_KEY,
+                "units": "imperial", "cnt": 1,
+            }, timeout=5)
+            if resp.status_code == 200:
+                print("  [OK] OpenWeatherMap API key validated")
+            elif resp.status_code == 401:
+                print("  [WARN] OpenWeatherMap API key INVALID (401)")
+            else:
+                print(f"  [WARN] OpenWeatherMap API returned {resp.status_code}")
+        except Exception as exc:
+            print(f"  [WARN] OpenWeatherMap API unreachable: {exc}")
+    else:
+        print("  [--] No OpenWeatherMap key (set OPENWEATHERMAP_API_KEY for weather edge)")
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Polymarket Live Opportunity Scanner v2")
+    print("  Polymarket Live Opportunity Scanner v3")
     print("  http://localhost:5000")
+    print("=" * 60)
+    _validate_api_keys()
     print("=" * 60)
     app.run(host="0.0.0.0", port=PORT, debug=False)
