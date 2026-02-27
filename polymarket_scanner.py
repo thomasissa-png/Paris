@@ -3322,7 +3322,8 @@ def classify(max_price: float, deviation: float,
         return ("interesting", "Petit arb", "arbitrage")
 
     # --- Near-certain (EV ≈ $0, involves luck) → watch only ---
-    if max_price > 0.90:
+    # Threshold 95%: reduces noise from semi-certain markets (90-95%)
+    if max_price > 0.95:
         return ("watch", "Haute proba", "near_certain")
 
     return (None, "", "")
@@ -3902,6 +3903,7 @@ button{font-family:var(--font);cursor:pointer}
 /* card top */
 .card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 .card-question{font-size:13.5px;font-weight:600;color:var(--pm-text-primary);line-height:1.4;flex:1;min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.anomaly-card .card-question{-webkit-line-clamp:4;font-size:14px}
 .card-question a{color:inherit;transition:color .12s}
 .card-question a:hover{color:var(--pm-blue)}
 .card-badges{display:flex;align-items:center;gap:4px;flex-shrink:0}
@@ -4119,12 +4121,13 @@ button{font-family:var(--font);cursor:pointer}
       <div class="card-grid" id="tier-int"></div>
     </div>
     <div class="tier-section tier-watch" id="sec-watch">
-      <div class="tier-header">
+      <div class="tier-header" style="cursor:pointer" onclick="var g=document.getElementById('tier-watch'),b=document.getElementById('watch-toggle');if(g.style.display==='none'){g.style.display='';b.textContent='Masquer'}else{g.style.display='none';b.textContent='Afficher'}">
         <span class="tier-icon">&#128064;</span>
         <span class="tier-label">Speculatif</span>
         <span class="tier-count" id="cnt-watch">0</span>
+        <span id="watch-toggle" style="font-size:11px;color:var(--pm-text-tertiary);margin-left:8px;font-weight:400">Afficher</span>
       </div>
-      <div class="card-grid" id="tier-watch"></div>
+      <div class="card-grid" id="tier-watch" style="display:none"></div>
     </div>
   </div>
 

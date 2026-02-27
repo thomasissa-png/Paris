@@ -101,7 +101,7 @@ def _make_market(now, **overrides):
         "endDate": (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "volume": "5000000",
         "liquidity": "50000",
-        "outcomePrices": '["0.94", "0.06"]',
+        "outcomePrices": '["0.96", "0.04"]',
         "outcomes": '["Yes", "No"]',
     }
     base.update(overrides)
@@ -170,27 +170,27 @@ class TestClassify:
     # --- Near-certain → watch ONLY (not interesting) ---
 
     def test_near_certain_watch_only(self):
-        """max_price > 90% → watch/near_certain (NOT interesting)."""
-        tier, label, rtype = classify(0.94, 0.0, 1.0)
+        """max_price > 95% → watch/near_certain (NOT interesting)."""
+        tier, label, rtype = classify(0.96, 0.0, 1.0)
         assert tier == "watch"
         assert rtype == "near_certain"
 
     def test_near_certain_never_interesting(self):
-        """Even 95% → watch, never interesting."""
-        tier, _, _ = classify(0.95, 0.0, 1.0)
+        """Even 97% → watch, never interesting."""
+        tier, _, _ = classify(0.97, 0.0, 1.0)
         assert tier == "watch"
         assert tier != "interesting"
 
-    # --- 80-90% removed (too speculative) ---
+    # --- 80-95% removed (too speculative, EV ≈ $0) ---
 
-    def test_80_90_removed(self):
-        """0.80-0.90 probability → filtered (too much luck)."""
-        tier, _, _ = classify(0.85, 0.0, 1.0)
+    def test_below_95_removed(self):
+        """0.80-0.95 probability → filtered (too much luck)."""
+        tier, _, _ = classify(0.94, 0.0, 1.0)
         assert tier is None
 
-    def test_exactly_90_filtered(self):
-        """0.90 exactly → NOT > 0.90, filtered."""
-        tier, _, _ = classify(0.90, 0.0, 1.0)
+    def test_exactly_95_filtered(self):
+        """0.95 exactly → NOT > 0.95, filtered."""
+        tier, _, _ = classify(0.95, 0.0, 1.0)
         assert tier is None
 
     # --- Too certain (without edge) ---
@@ -525,14 +525,14 @@ class TestProcessMarket:
     # --- Near-certain → watch (not interesting) ---
 
     def test_near_certain_binary_market(self, now):
-        """94/6 market → WATCH/near_certain with EV ~$0."""
+        """96/4 market → WATCH/near_certain with EV ~$0."""
         m = _make_market(now)
         result = process_market(m, now)
         assert result is not None
         assert result["tier"] == "watch"
         assert result["reason_type"] == "near_certain"
-        assert result["yes"] == 0.94
-        assert result["no"] == 0.06
+        assert result["yes"] == 0.96
+        assert result["no"] == 0.04
         assert result["is_binary"] is True
         assert result["guaranteed"] is False
         # Near-certain: no edge
@@ -551,7 +551,7 @@ class TestProcessMarket:
 
     def test_trade_recommendation_buy_yes(self, now):
         """Near-certain → BUY best outcome, SPECULATIF."""
-        m = _make_market(now, outcomePrices='["0.94", "0.06"]')
+        m = _make_market(now, outcomePrices='["0.96", "0.04"]')
         result = process_market(m, now)
         assert result is not None
         assert "BUY" in result["trade_label"]
@@ -659,16 +659,16 @@ class TestProcessMarket:
     # --- ROI ---
 
     def test_roi_calculation(self, now):
-        m = _make_market(now, outcomePrices='["0.94", "0.06"]')
+        m = _make_market(now, outcomePrices='["0.96", "0.04"]')
         result = process_market(m, now)
         assert result is not None
-        assert abs(result["profit_100"] - 6.38) < 0.1
+        assert abs(result["profit_100"] - 4.17) < 0.1
         assert result["ann_roi"] > 0
 
     def test_ann_roi_capped(self, now):
         m = _make_market(
             now,
-            outcomePrices='["0.94", "0.06"]',
+            outcomePrices='["0.96", "0.04"]',
             endDate=(now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         result = process_market(m, now)
@@ -677,7 +677,7 @@ class TestProcessMarket:
         assert result["ann_roi_capped"] is True
 
     def test_ann_roi_not_capped_for_longer_markets(self, now):
-        m = _make_market(now, outcomePrices='["0.94", "0.06"]')
+        m = _make_market(now, outcomePrices='["0.96", "0.04"]')
         result = process_market(m, now)
         assert result is not None
         assert result["ann_roi_capped"] is False
@@ -818,7 +818,7 @@ class TestProcessMarket:
         assert result["yes_label"] == "Yes"
 
     def test_prices_as_list_not_string(self, now):
-        m = _make_market(now, outcomePrices=[0.94, 0.06])
+        m = _make_market(now, outcomePrices=[0.96, 0.04])
         result = process_market(m, now)
         assert result is not None
 
@@ -837,7 +837,7 @@ class TestProcessMarket:
     def test_arb_score_higher_than_near_certain_in_pipeline(self, now):
         """End-to-end: arb markets score much higher than near-certain."""
         m_arb = _make_market(now, outcomePrices='["0.45", "0.48"]')
-        m_nc = _make_market(now, outcomePrices='["0.94", "0.06"]')
+        m_nc = _make_market(now, outcomePrices='["0.96", "0.04"]')
         r_arb = process_market(m_arb, now)
         r_nc = process_market(m_nc, now)
         assert r_arb is not None and r_nc is not None
