@@ -83,7 +83,7 @@ ODDS_CACHE_TTL = 300     # 5 min cache for sports odds
 CLOB_API_BASE = "https://clob.polymarket.com"
 CLOB_CACHE_TTL = 30      # 30s cache for order books
 
-# --- Anomaly detection (trading anomaly scanner) ---
+# --- Anomaly detection (insider trading scanner) ---
 ANOMALY_PRICE_CACHE_TTL = 120    # 2 min cache for price history
 ANOMALY_VOL_SPIKE_THRESHOLD = 5.0   # 24h vol > 5× daily avg = spike
 ANOMALY_PRICE_JUMP_PCT = 10.0       # >10% price jump in history = anomaly
@@ -97,10 +97,17 @@ ANOMALY_REVERSAL_THRESHOLD = 40.0   # >40% of spike retraced = reversal (pump&du
 ANOMALY_SPREAD_SPIKE_MULT = 3.0     # spread > 3× normal = market maker flight
 ANOMALY_DEPTH_DROP_PCT = 60.0       # bid depth drops >60% = depth collapse
 ANOMALY_CONVERGENCE_BONUS = 1.5     # severity multiplier when 3+ signals converge
-ANOMALY_OFF_HOURS_START = 2         # UTC hour — suspicious window start
-ANOMALY_OFF_HOURS_END = 6           # UTC hour — suspicious window end
 ANOMALY_PERSISTENCE_DECAY = 0.8     # decay factor per scan for persistence tracking
 ANOMALY_PERSISTENCE_BOOST = 2.0     # severity boost for repeated anomalies
+# Context-aware dampening: suppress false positives near known events
+ANOMALY_NEAR_EVENT_DAYS = 2.0       # markets resolving within 2d → expected activity
+ANOMALY_SPORTS_DAMPEN = 0.3         # severity multiplier for sports near resolution
+ANOMALY_POLITICS_DAMPEN = 0.5       # severity multiplier for politics near resolution
+ANOMALY_OTHER_DAMPEN = 0.6          # severity multiplier for other near resolution
+# Stealth accumulation detection
+ANOMALY_STEALTH_MIN_POINTS = 8      # min price history points for trend detection
+ANOMALY_STEALTH_DIRECTION_PCT = 70  # >70% of moves in same direction = stealth
+ANOMALY_STEALTH_MAX_STEP_PCT = 3.0  # each step < 3% (not a jump, but persistent drift)
 
 # --- Notifications ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -2502,52 +2509,80 @@ def _detect_book_anomaly(market: dict) -> dict | None:
     return None
 
 
-def _detect_off_hours_activity(history: list[dict]) -> dict | None:
-    """Detect significant price movement during off-hours (2-6 AM UTC).
+def _detect_stealth_accumulation(history: list[dict]) -> dict | None:
+    """Detect stealth accumulation: many small moves in the same direction.
 
-    Insider trading often happens when fewer eyes are watching.
-    Large moves during off-hours are statistically more suspicious.
+    Real insider pattern: buy gradually in small increments to avoid
+    triggering price jump alerts. Each step < 3% but >70% of steps
+    go in the same direction → persistent informed buying/selling.
+    This is FAR more indicative of insider trading than off-hours activity.
     """
-    if len(history) < 3:
+    if len(history) < ANOMALY_STEALTH_MIN_POINTS:
         return None
 
-    off_hour_moves = []
+    up_moves = 0
+    down_moves = 0
+    small_up = 0
+    small_down = 0
+
     for i in range(1, len(history)):
-        t = history[i]["t"]
-        # Convert Unix timestamp to UTC hour
-        try:
-            hour = datetime.fromtimestamp(t, tz=timezone.utc).hour
-        except (OSError, ValueError, OverflowError):
+        p_prev = history[i - 1]["p"]
+        p_curr = history[i]["p"]
+        if p_prev <= 0:
             continue
-        if ANOMALY_OFF_HOURS_START <= hour < ANOMALY_OFF_HOURS_END:
-            p_prev = history[i - 1]["p"]
-            p_curr = history[i]["p"]
-            if p_prev > 0:
-                move_pct = abs(p_curr - p_prev) / p_prev * 100
-                if move_pct >= 5.0:  # significant move during off-hours
-                    off_hour_moves.append({
-                        "hour": hour, "move_pct": move_pct,
-                        "from": p_prev, "to": p_curr,
-                    })
+        change_pct = (p_curr - p_prev) / p_prev * 100
+        abs_change = abs(change_pct)
 
-    if not off_hour_moves:
+        if change_pct > 0.1:  # meaningful up move (not noise)
+            up_moves += 1
+            if abs_change <= ANOMALY_STEALTH_MAX_STEP_PCT:
+                small_up += 1
+        elif change_pct < -0.1:
+            down_moves += 1
+            if abs_change <= ANOMALY_STEALTH_MAX_STEP_PCT:
+                small_down += 1
+
+    total_moves = up_moves + down_moves
+    if total_moves < 5:
         return None
 
-    biggest = max(off_hour_moves, key=lambda x: x["move_pct"])
-    sev = min(biggest["move_pct"] / 5.0, 10.0)
-    direction = "hausse" if biggest["to"] > biggest["from"] else "baisse"
+    # Check directional dominance among small moves
+    total_small = small_up + small_down
+    if total_small < 5:
+        return None
+
+    direction_pct = max(small_up, small_down) / total_small * 100
+    if direction_pct < ANOMALY_STEALTH_DIRECTION_PCT:
+        return None
+
+    # Calculate total drift
+    first_p = history[0]["p"]
+    last_p = history[-1]["p"]
+    total_drift_pct = abs(last_p - first_p) / first_p * 100 if first_p > 0 else 0
+
+    # Must have meaningful drift (>5%) achieved via small steps
+    if total_drift_pct < 5.0:
+        return None
+
+    is_buying = small_up > small_down
+    direction = "hausse" if is_buying else "baisse"
+
+    sev = min((direction_pct / ANOMALY_STEALTH_DIRECTION_PCT) *
+              (total_drift_pct / 5.0), 10.0)
 
     return {
-        "type": "off_hours",
+        "type": "stealth_accumulation",
         "severity": sev,
-        "label": "Activité Nocturne",
+        "label": "Accumulation Furtive",
         "description": (
-            f"Mouvement de {biggest['move_pct']:.0f}% à {biggest['hour']}h UTC "
-            f"({biggest['from'] * 100:.0f}% → {biggest['to'] * 100:.0f}%, "
-            f"{direction}) — horaire suspect"),
-        "move_pct": round(biggest["move_pct"], 1),
-        "hour": biggest["hour"],
-        "moves_count": len(off_hour_moves),
+            f"{int(direction_pct)}% des mouvements en {direction} "
+            f"({max(small_up, small_down)}/{total_small} micro-ordres) — "
+            f"dérive totale {total_drift_pct:.1f}% "
+            f"({first_p * 100:.0f}% → {last_p * 100:.0f}%)"),
+        "direction_pct": round(direction_pct, 1),
+        "total_drift_pct": round(total_drift_pct, 1),
+        "small_moves": total_small,
+        "direction": "up" if is_buying else "down",
     }
 
 
@@ -2580,15 +2615,12 @@ def _compute_trade_direction(anomalies: list[dict],
                 no_signals += 3  # after pump & dump → go No
             else:
                 yes_signals += 3
-        elif atype == "off_hours":
-            # Follow the off-hours direction (insiders move first)
-            if a.get("move_pct", 0) > 0:
-                # Check direction from description
-                desc = a.get("description", "")
-                if "hausse" in desc:
-                    yes_signals += 1
-                elif "baisse" in desc:
-                    no_signals += 1
+        elif atype == "stealth_accumulation":
+            # Stealth = strong insider signal, high weight
+            if a.get("direction") == "up":
+                yes_signals += 3  # persistent buying → Yes
+            elif a.get("direction") == "down":
+                no_signals += 3
 
     # Use last price momentum if available
     if price_history and len(price_history) >= 2:
@@ -2620,6 +2652,49 @@ def _compute_trade_direction(anomalies: list[dict],
         }
     return {"direction": "unknown", "confidence": 0.5,
             "reasoning": "Signaux contradictoires (volume sans direction claire)"}
+
+
+def _compute_context_dampen(category: str, days_left: float,
+                            anomaly_types: set[str]) -> float:
+    """Compute severity dampening factor based on market context.
+
+    Near-event volume spikes are NORMAL, not insider trading.
+    Sports match in 6h with high volume? Expected. Political vote
+    tomorrow with price moves? Expected. Crypto pump-and-dump 2
+    weeks before resolution? THAT is suspicious.
+
+    Returns multiplier 0.0-1.0 (1.0 = no dampening, keep full severity).
+    """
+    # High-value signals (reversal, stealth, book anomaly) are NEVER dampened
+    # — these are true insider signals regardless of timing
+    insider_signals = {"reversal", "stealth_accumulation", "book_anomaly"}
+    if anomaly_types & insider_signals:
+        return 1.0  # never dampen real insider patterns
+
+    # Not near resolution → no dampening
+    if days_left > ANOMALY_NEAR_EVENT_DAYS:
+        return 1.0
+
+    # Near resolution: dampen volume/VL/price signals by category
+    cat_lower = category.lower() if category else ""
+    if cat_lower == "sports":
+        return ANOMALY_SPORTS_DAMPEN  # 0.3 — sports pre-match volume is totally normal
+    elif cat_lower in ("politics", "elections"):
+        return ANOMALY_POLITICS_DAMPEN  # 0.5
+    else:
+        return ANOMALY_OTHER_DAMPEN  # 0.6
+
+
+# Insider trading signal quality weights (higher = more indicative of insider)
+_INSIDER_SIGNAL_WEIGHT: dict[str, float] = {
+    "reversal": 3.0,          # pump & dump = classic insider pattern
+    "stealth_accumulation": 2.5,  # gradual informed buying
+    "book_anomaly": 2.0,      # market makers flee before news
+    "price_velocity": 1.2,    # fast move might be informed
+    "price_jump": 1.0,        # could be news, could be insider
+    "vl_imbalance": 0.8,      # ambiguous — thin book + any reason
+    "volume_spike": 0.5,      # weakest signal — everyone spikes volume
+}
 
 
 def _apply_convergence_boost(anomalies: list[dict]) -> float:
@@ -2796,19 +2871,42 @@ def detect_anomalies(market: dict, now: datetime,
             if rev_anom:
                 anomalies.append(rev_anom)
 
-            # 4d) Off-hours activity
-            off_anom = _detect_off_hours_activity(hist)
-            if off_anom:
-                anomalies.append(off_anom)
+            # 4d) Stealth accumulation (replaces off-hours — much better
+            # insider signal: many small moves in same direction)
+            stealth_anom = _detect_stealth_accumulation(hist)
+            if stealth_anom:
+                anomalies.append(stealth_anom)
 
     if not anomalies:
         return None
+
+    # --- Category + days_left for context-aware dampening ---
+    category = extract_category(market)
+    end_dt = parse_date(market.get("endDate"))
+    days_left = 0.0
+    if end_dt:
+        delta_s = (end_dt - now).total_seconds()
+        days_left = max(delta_s / 86400.0, 0)
+
+    # --- Context-aware dampening ---
+    # Suppress normal pre-event activity (sports before match, etc.)
+    anomaly_types = set(a["type"] for a in anomalies)
+    context_dampen = _compute_context_dampen(category, days_left, anomaly_types)
+
+    # --- Insider-weighted severity ---
+    # Weight each anomaly by how indicative it is of insider trading
+    weighted_max = 0.0
+    for a in anomalies:
+        weight = _INSIDER_SIGNAL_WEIGHT.get(a["type"], 1.0)
+        weighted_sev = a["severity"] * weight
+        if weighted_sev > weighted_max:
+            weighted_max = weighted_sev
 
     # --- Convergence boost (multiple signal types = higher confidence) ---
     convergence_mult = _apply_convergence_boost(anomalies)
 
     # --- Composite severity ---
-    raw_max_severity = max(a["severity"] for a in anomalies)
+    raw_max_severity = weighted_max
     # Persistence boost
     market_id = condition_id or slug or question[:40]
     persistence_score = _get_persistence_score(market_id)
@@ -2816,7 +2914,14 @@ def detect_anomalies(market: dict, now: datetime,
     if persistence_score >= 2.0:
         persistence_mult = min(1.0 + persistence_score * 0.2, ANOMALY_PERSISTENCE_BOOST)
 
-    max_severity = min(raw_max_severity * convergence_mult * persistence_mult, 10.0)
+    max_severity = min(
+        raw_max_severity * convergence_mult * persistence_mult * context_dampen,
+        10.0,
+    )
+
+    # After dampening, if severity drops below 1.0 → not worth showing
+    if max_severity < 1.0:
+        return None
 
     # Severity label
     if max_severity >= 7.0:
@@ -2829,15 +2934,6 @@ def detect_anomalies(market: dict, now: datetime,
         severity_label = "modéré"
         severity_class = "moderate"
 
-    category = extract_category(market)
-
-    # Days left
-    end_dt = parse_date(market.get("endDate"))
-    days_left = 0.0
-    if end_dt:
-        delta_s = (end_dt - now).total_seconds()
-        days_left = max(delta_s / 86400.0, 0)
-
     # Primary price history for chart (Yes token)
     price_history = all_histories[0] if all_histories else []
 
@@ -2846,6 +2942,11 @@ def detect_anomalies(market: dict, now: datetime,
 
     # Convergence info
     signal_types = sorted(set(a["type"] for a in anomalies))
+
+    # Insider quality score: how likely this is REAL insider trading vs noise
+    has_insider_signal = bool(anomaly_types & {"reversal", "stealth_accumulation",
+                                               "book_anomaly"})
+    insider_label = "Insider probable" if has_insider_signal else "Activité suspecte"
 
     return {
         "id": market_id,
@@ -2871,6 +2972,9 @@ def detect_anomalies(market: dict, now: datetime,
         "trade_direction": trade_dir,
         "price_history": price_history[-24:] if price_history else [],
         "detected_at": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "context_dampen": round(context_dampen, 2),
+        "insider_label": insider_label,
+        "has_insider_signal": has_insider_signal,
     }
 
 
@@ -4091,7 +4195,7 @@ button{font-family:var(--font);cursor:pointer}
     <div class="anomaly-section" id="sec-anomaly" style="display:none">
       <div class="anomaly-header">
         <span class="tier-icon">&#128680;</span>
-        <span class="anomaly-label">Anomalies de Trading</span>
+        <span class="anomaly-label">D&eacute;tection Insider Trading</span>
         <span class="anomaly-count" id="cnt-anomaly">0</span>
       </div>
       <div class="card-grid" id="tier-anomaly"></div>
@@ -4332,14 +4436,21 @@ function renderMiniChart(history){
 function renderAnomalyCard(item){
   var link=item.url?'<a href="'+esc(item.url)+'" target="_blank" rel="noopener">'+esc(item.question)+'</a>':esc(item.question);
 
-  /* severity badge + convergence */
+  /* insider label + severity badge */
   var sevCls='severity-'+item.severity_class;
-  var bdg='<span class="anomaly-severity '+sevCls+'">'+esc(item.severity_label)+' ('+item.max_severity.toFixed(1)+')</span>';
+  var bdg='';
+  if(item.has_insider_signal){
+    bdg+='<span style="font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;background:rgba(255,59,48,0.25);color:#ff3b30;border:1px solid rgba(255,59,48,0.4)">INSIDER</span>';
+  }
+  bdg+='<span class="anomaly-severity '+sevCls+'">'+esc(item.severity_label)+' ('+item.max_severity.toFixed(1)+')</span>';
   if(item.convergence_mult&&item.convergence_mult>1.0){
     bdg+='<span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(255,59,48,0.2);color:#ff3b30">'+item.signal_types.length+' SIGNAUX</span>';
   }
   if(item.persistence_score&&item.persistence_score>=2.0){
     bdg+='<span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(155,109,255,0.2);color:#9b6dff">RECURRENT</span>';
+  }
+  if(item.context_dampen&&item.context_dampen<1.0){
+    bdg+='<span style="font-size:9px;font-weight:400;padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.05);color:var(--pm-text-tertiary)">pre-event &times;'+item.context_dampen.toFixed(1)+'</span>';
   }
   if(item.days_left!==undefined){
     var dl=item.days_left;

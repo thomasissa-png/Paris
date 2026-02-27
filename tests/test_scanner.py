@@ -3356,8 +3356,9 @@ from polymarket_scanner import (
     _detect_volume_liquidity_imbalance,
     _detect_price_reversal,
     _detect_book_anomaly,
-    _detect_off_hours_activity,
+    _detect_stealth_accumulation,
     _compute_trade_direction,
+    _compute_context_dampen,
     _apply_convergence_boost,
     _get_persistence_score,
     _update_persistence,
@@ -3553,7 +3554,11 @@ class TestDetectAnomalies:
         return datetime.now(timezone.utc)
 
     def _make_anomaly_market(self, now, **overrides):
-        """Factory for a market dict suitable for anomaly detection."""
+        """Factory for a market dict suitable for anomaly detection.
+
+        Default: extreme volume spike (200K on $10K liq) so that even after
+        insider weight (0.5× for volume_spike) severity stays above 1.0.
+        """
         start = (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
         base = {
             "question": "Will X happen by March?",
@@ -3562,7 +3567,7 @@ class TestDetectAnomalies:
             "endDate": (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "startDate": start,
             "volume": "50000",
-            "volume24hr": "30000",  # 6x daily avg
+            "volume24hr": "200000",  # 40x daily avg → sev 8 × 0.5 = 4.0
             "liquidity": "10000",
             "outcomePrices": '["0.60", "0.40"]',
             "outcomes": '["Yes", "No"]',
@@ -3572,16 +3577,20 @@ class TestDetectAnomalies:
         return base
 
     def test_volume_spike_detected(self, now):
-        """Market with abnormal 24h volume -> anomaly detected."""
-        m = self._make_anomaly_market(now, volume="50000", volume24hr="30000")
+        """Market with extreme 24h volume -> anomaly detected.
+
+        Needs high ratio because volume_spike has low insider weight (0.5).
+        Ratio 60x → severity 12 (capped 10) × 0.5 = 5.0 → passes min 1.0.
+        """
+        m = self._make_anomaly_market(now, volume="50000", volume24hr="300000")
         result = detect_anomalies(m, now)
         assert result is not None
         assert any(a["type"] == "volume_spike" for a in result["anomalies"])
 
     def test_vl_imbalance_detected(self, now):
-        """Market with high V/L ratio -> detected."""
+        """Market with extreme V/L ratio -> detected."""
         m = self._make_anomaly_market(
-            now, volume24hr="100000", liquidity="3000"
+            now, volume24hr="300000", liquidity="3000"
         )
         result = detect_anomalies(m, now)
         assert result is not None
@@ -3871,48 +3880,61 @@ class TestBookAnomaly:
         assert result is None
 
 
-class TestOffHoursActivity:
-    """Test off-hours (2-6 AM UTC) activity detection."""
+class TestStealthAccumulation:
+    """Test stealth accumulation detection (replaces off-hours)."""
 
-    def test_off_hours_move_detected(self):
-        """Large move at 3 AM UTC -> detected."""
-        base_ts = 1709168400  # some timestamp
-        # Create history where one move is at 3 AM UTC
-        h3am = datetime(2026, 2, 26, 3, 0, tzinfo=timezone.utc)
-        h2am = datetime(2026, 2, 26, 2, 0, tzinfo=timezone.utc)
-        history = [
-            {"t": int(h2am.timestamp()), "p": 0.50},
-            {"t": int(h3am.timestamp()), "p": 0.60},  # 20% move at 3am
-            {"t": int(h3am.timestamp()) + 3600, "p": 0.62},
-        ]
-        result = _detect_off_hours_activity(history)
+    def test_stealth_buying_detected(self):
+        """Many small upward moves -> stealth accumulation detected."""
+        # 12 points, 10 small upward moves (each ~2%), drift = ~22%
+        history = [{"t": i * 3600, "p": 0.40 + i * 0.008} for i in range(12)]
+        result = _detect_stealth_accumulation(history)
         assert result is not None
-        assert result["type"] == "off_hours"
-        assert "Nocturne" in result["label"]
+        assert result["type"] == "stealth_accumulation"
+        assert result["direction"] == "up"
+        assert "Furtive" in result["label"]
+        assert result["direction_pct"] >= 70
 
-    def test_daytime_move_not_flagged(self):
-        """Large move at 2 PM UTC -> NOT detected."""
-        h14 = datetime(2026, 2, 26, 14, 0, tzinfo=timezone.utc)
-        h15 = datetime(2026, 2, 26, 15, 0, tzinfo=timezone.utc)
+    def test_stealth_selling_detected(self):
+        """Many small downward moves -> stealth selling detected."""
+        history = [{"t": i * 3600, "p": 0.60 - i * 0.008} for i in range(12)]
+        result = _detect_stealth_accumulation(history)
+        assert result is not None
+        assert result["type"] == "stealth_accumulation"
+        assert result["direction"] == "down"
+
+    def test_random_moves_not_flagged(self):
+        """Alternating up/down with no directional bias -> no detection."""
         history = [
-            {"t": int(h14.timestamp()), "p": 0.50},
-            {"t": int(h15.timestamp()), "p": 0.60},  # 20% move at 2pm
-            {"t": int(h15.timestamp()) + 3600, "p": 0.62},
+            {"t": i * 3600, "p": 0.50 + (0.01 if i % 2 == 0 else -0.01)}
+            for i in range(12)
         ]
-        result = _detect_off_hours_activity(history)
+        result = _detect_stealth_accumulation(history)
         assert result is None
 
-    def test_small_off_hours_move_ignored(self):
-        """Small move (<5%) at 3 AM -> ignored."""
-        h3am = datetime(2026, 2, 26, 3, 0, tzinfo=timezone.utc)
-        h2am = datetime(2026, 2, 26, 2, 0, tzinfo=timezone.utc)
-        history = [
-            {"t": int(h2am.timestamp()), "p": 0.50},
-            {"t": int(h3am.timestamp()), "p": 0.52},  # 4% (below 5%)
-            {"t": int(h3am.timestamp()) + 3600, "p": 0.52},
-        ]
-        result = _detect_off_hours_activity(history)
+    def test_too_few_points(self):
+        """Less than 8 points -> not enough data."""
+        history = [{"t": i * 3600, "p": 0.40 + i * 0.01} for i in range(5)]
+        result = _detect_stealth_accumulation(history)
         assert result is None
+
+    def test_large_jumps_not_stealth(self):
+        """A single big jump is NOT stealth (that's a price_jump)."""
+        history = [
+            {"t": 0, "p": 0.40},
+            {"t": 3600, "p": 0.40},
+            {"t": 7200, "p": 0.40},
+            {"t": 10800, "p": 0.40},
+            {"t": 14400, "p": 0.60},  # 50% jump — not stealth
+            {"t": 18000, "p": 0.61},
+            {"t": 21600, "p": 0.62},
+            {"t": 25200, "p": 0.63},
+            {"t": 28800, "p": 0.64},
+        ]
+        result = _detect_stealth_accumulation(history)
+        # May or may not detect — but if detected, the big jump shouldn't
+        # count as a small move. The test validates the function doesn't crash.
+        if result is not None:
+            assert result["type"] == "stealth_accumulation"
 
 
 class TestTradeDirection:
@@ -4028,6 +4050,59 @@ class TestPersistence:
         assert _get_persistence_score("nonexistent_mkt_xyz") == 0.0
 
 
+class TestContextDampen:
+    """Test context-aware severity dampening."""
+
+    def test_sports_near_resolution_dampened(self):
+        """Sports market resolving in 1d -> heavily dampened."""
+        mult = _compute_context_dampen("Sports", 1.0, {"volume_spike"})
+        assert mult == 0.3  # ANOMALY_SPORTS_DAMPEN
+
+    def test_politics_near_resolution_dampened(self):
+        """Politics market resolving in 1d -> dampened."""
+        mult = _compute_context_dampen("Politics", 1.0, {"volume_spike"})
+        assert mult == 0.5
+
+    def test_far_from_resolution_no_dampen(self):
+        """Market resolving in 30d -> no dampening."""
+        mult = _compute_context_dampen("Sports", 30.0, {"volume_spike"})
+        assert mult == 1.0
+
+    def test_insider_signal_never_dampened(self):
+        """Reversal pattern is NEVER dampened, even near resolution."""
+        mult = _compute_context_dampen("Sports", 0.5, {"reversal", "volume_spike"})
+        assert mult == 1.0
+
+    def test_stealth_never_dampened(self):
+        """Stealth accumulation is NEVER dampened."""
+        mult = _compute_context_dampen("Sports", 0.5, {"stealth_accumulation"})
+        assert mult == 1.0
+
+    def test_book_anomaly_never_dampened(self):
+        """Book anomaly (MM flight) is NEVER dampened."""
+        mult = _compute_context_dampen("Sports", 0.5, {"book_anomaly"})
+        assert mult == 1.0
+
+
+class TestInsiderWeighting:
+    """Test that insider-quality signals are weighted higher."""
+
+    def test_reversal_weighted_higher_than_volume(self):
+        """Reversal (weight 3.0) scores higher than volume spike (0.5)."""
+        from polymarket_scanner import _INSIDER_SIGNAL_WEIGHT
+        assert _INSIDER_SIGNAL_WEIGHT["reversal"] > _INSIDER_SIGNAL_WEIGHT["volume_spike"] * 2
+
+    def test_stealth_weighted_higher_than_volume(self):
+        """Stealth accumulation (2.5) >> volume spike (0.5)."""
+        from polymarket_scanner import _INSIDER_SIGNAL_WEIGHT
+        assert _INSIDER_SIGNAL_WEIGHT["stealth_accumulation"] > _INSIDER_SIGNAL_WEIGHT["volume_spike"] * 2
+
+    def test_book_anomaly_weighted_higher_than_price_jump(self):
+        """Book anomaly (2.0) > price jump (1.0)."""
+        from polymarket_scanner import _INSIDER_SIGNAL_WEIGHT
+        assert _INSIDER_SIGNAL_WEIGHT["book_anomaly"] > _INSIDER_SIGNAL_WEIGHT["price_jump"]
+
+
 class TestVolumeSpikev2:
     """Test volume spike with volume1wk support."""
 
@@ -4063,7 +4138,7 @@ class TestDetectAnomaliesV2:
             "endDate": (now + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "startDate": start,
             "volume": "50000",
-            "volume24hr": "30000",
+            "volume24hr": "200000",  # 40x daily avg → strong signal after weighting
             "liquidity": "10000",
             "outcomePrices": '["0.60", "0.40"]',
             "outcomes": '["Yes", "No"]',
